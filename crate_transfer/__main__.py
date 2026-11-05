@@ -7,7 +7,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from .config import Settings, data_directory
 from .ui import STYLE, Window, app_icon
@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description="Crate Transfer desktop agent")
     parser.add_argument("--data-dir", type=Path, help="Override agent settings directory (not Serato's Library)")
     parser.add_argument("--smoke-test", action="store_true", help="Render UI without LAN services and quit")
+    parser.add_argument("--background", action="store_true", help="Start quietly in the menu bar / system tray")
     parser.add_argument("--screenshot", type=Path, help="Save a screenshot during --smoke-test")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
@@ -42,7 +43,8 @@ def main():
         QMessageBox.critical(None, "Crate Transfer could not start", str(error))
         return 1
     app.setQuitOnLastWindowClosed(False)
-    window.show()
+    if not args.background or args.smoke_test or not QSystemTrayIcon.isSystemTrayAvailable():
+        window.show()
     if args.smoke_test:
         def finish():
             if args.screenshot:

@@ -22,21 +22,21 @@ On Windows, use `python` instead of `python3`, and activate with
 ## Transfer a crate
 
 1. Run the app on **both** computers. Allow local-network access and the
-   receiver's firewall prompt on private networks.
+   firewall prompts on private networks.
 2. In **Settings**, choose each computer's Serato **Library folder** and
    **Received music folder**. Start Serato DJ 4 once if the library does not
    exist yet. The app deliberately does not invent an empty Serato database.
    Selecting the parent `Serato` folder also works: the app resolves its
    `Library` subfolder and saves the actual database-folder path.
-3. On the receiver, open **Computers → Allow pairing for 2 minutes**.
-4. On the sender, select the discovered receiver and click **Pair selected
-   receiver**, or use **Pair by address**, and enter the receiver's six-digit
-   code. No fingerprint copying or comparison is required. Pair for the first
+3. On either computer, open **Computers → Allow pairing for 2 minutes**.
+4. On the other computer, select it and click **Pair selected
+   computer**, or use **Pair by address**, and enter its six-digit
+   PIN, shown in bold green. No fingerprint copying or comparison is required. Pair for the first
    time on a trusted private network.
-5. **Quit Serato DJ on the receiver.** In **Send crates**, check the crates
-   you want, choose that paired receiver, and click **Send selected crates**.
+5. **Quit Serato DJ on the computer getting the crates.** In **Send crates**, check the crates
+   you want, choose that paired computer, and click **Send selected crates**.
    Selecting a parent includes its descendants. No other crates are sent.
-6. Follow **Activity** on either computer. When the receiver reports
+6. Follow **Activity** on either computer. When the destination computer reports
    **Complete**, open Serato. Crates retain their original names, hierarchy and
    track order. If a crate name already exists, the new crate gets a number
    such as `Live Set (2)`; existing crates are never merged or replaced.
@@ -45,13 +45,23 @@ Pairing enables **both sending and receiving** on both computers with one code.
 Update both apps first. Existing directional pairings can be upgraded by
 pairing again once; no crates or music are sent during pairing.
 After pairing, trusted computers can import without a prompt whenever the
-receiver is running and Serato is closed. **Forget / revoke selected** removes
+agent is running and Serato is closed. **Forget / revoke selected** removes
 the local outgoing pairing and incoming permission. Remove the pairing on
 the other computer too to revoke access there.
 
 Closing the window keeps the agent in the menu bar / tray. Use its **Quit**
-menu item to stop it. Add the packaged app to macOS **Login Items** or Windows
-**Startup** if you want the agent available after signing in.
+menu item to stop it. Enable **Settings → Launch at login** to start quietly
+after signing in. On macOS, copy the packaged app into `/Applications` first;
+on Windows keep the extracted application folder in a permanent location.
+This opt-in installs a per-user macOS LaunchAgent or Windows Run entry and does
+not require administrator access. Disable the checkbox and save to remove it.
+It takes effect at the next login, and never starts a transfer automatically.
+If no system tray is available, the window opens instead of hiding the agent.
+
+The Computers page shows discovered agents as **Online** in bold green.
+**Not discovered** means offline or unavailable to Bonjour/mDNS; it does not
+prevent connecting by address. A changed certificate is shown in bold red and
+never trusted automatically. Failures and uncertain outcomes are also bold red.
 
 ## Defaults and configuration
 
@@ -60,7 +70,7 @@ menu item to stop it. Add the packaged app to macOS **Login Items** or Windows
 | Serato Library | `~/Library/Application Support/Serato/Library` | `%LOCALAPPDATA%\Serato\Library` |
 | Incoming music | `~/Music/Serato Transfers` | `%USERPROFILE%\Music\Serato Transfers` |
 | Agent settings, logs, backups | `~/Library/Application Support/CrateTransfer` | `%LOCALAPPDATA%\CrateTransfer` |
-| Receiver | TCP 49783 | TCP 49783 |
+| Agent connection | TCP 49783 | TCP 49783 |
 
 Folder changes take effect for the next transfer. Name/port changes require
 an app restart. Use the actual path if Windows Known Folders are redirected,
@@ -69,7 +79,7 @@ Each folder field has a **Copy** button that copies its complete path, even
 when the field is scrolled or only part of its text is selected. Standard
 text selection, Copy/Paste context menus, and keyboard shortcuts also work.
 
-The sender's absolute paths are **not sent to or reused on the receiver**.
+Source absolute paths are **not sent to or reused on the destination computer**.
 A received file is stored as:
 
 ```text
@@ -151,9 +161,14 @@ It does not rely on legacy `Subcrates/*.crate` exports.
   32 hierarchy levels, 20 GiB per file, 500 GiB total, and an 8 MiB manifest.
 - One incoming transfer at a time; uploads are sequential. Cancellation works
   before import; it does not interrupt an active database transaction.
-- No automatic retry/resume. A lost final acknowledgement can mean the
-  receiver imported successfully: check its **Activity** before resending.
-  Interrupted imports are marked **Uncertain**, never success.
+- Uploads do not automatically resume. Imports can take longer on large
+  libraries: the app allows ten minutes for the final import response. If the
+  connection drops, it checks the authenticated remote transfer status for up
+  to another ten minutes, without resending files or importing a second time.
+  Completed receipts survive agent restarts. If the outcome still cannot be
+  confirmed, it remains **Uncertain**, never success. Select it in Activity and
+  use **Check uncertain transfer** to query the other computer again without
+  resending. Older agents must be updated to support these status queries.
 - macOS Apple Silicon bundle launch, Bonjour discovery and a complete synthetic
   music/crate import into the packaged receiver are verified in development.
   **No real Serato library or second physical computer was
@@ -196,8 +211,9 @@ be referenced. Abandoned partial upload staging is cleaned on agent restart.
 ## Test and package
 
 ```sh
+python -m pip install ".[build]"
 python -m unittest discover -s tests -v
-python -m crate_transfer --smoke-test --data-dir /tmp/crate-transfer-smoke
+python -m crate_transfer --smoke-test --data-dir .ui-smoke
 python -m PyInstaller --noconfirm CrateTransfer.spec
 ```
 
@@ -206,24 +222,64 @@ synthetic Serato-shaped databases and synthetic media, **not your library**.
 For an isolated development agent use `--data-dir <absolute-folder>`.
 
 - macOS output: `dist/Crate Transfer.app`. Copy it to Applications.
-  Separate downloads are named `Crate-Transfer-macOS-arm64.zip` (Apple Silicon)
-  and `Crate-Transfer-macOS-x86_64.zip` (Intel), both requiring macOS 12+.
-  Intel builds are tested under Rosetta on Apple Silicon, not on physical Intel
-  hardware.
+  CI downloads are `Crate-Transfer-macOS-arm64.dmg` (Apple Silicon) and
+  `Crate-Transfer-macOS-x86_64.dmg` (Intel). Open the DMG and drag the app
+  onto its Applications link. The bundle declares macOS 12+; CI tests macOS 15,
+  not the minimum OS version.
 - Windows output: `dist/Crate Transfer/Crate Transfer.exe`. Distribute the
-  **whole folder**, not the executable alone.
+  **whole folder**, not the executable alone. CI produces
+  `Crate-Transfer-Windows-x64.zip`; extract the entire ZIP before launching.
 - Build separately on each target OS/architecture. Local macOS builds are
   ad-hoc signed, **not Developer ID signed or notarized**. Distribution needs
-  the appropriate signing certificates/notarization. The GitHub Actions
-  workflow tests and packages on macOS and Windows.
-  For an isolated Intel Python environment, keep outputs separate:
+  the appropriate signing certificates/notarization. CI packages are also
+  not Developer ID signed or notarized; Windows packages are not Authenticode
+  signed.
+- `.github/workflows/build.yml` runs for branch pushes, pull requests, `v*`
+  tags and manual **Run workflow** requests. Explicit hosted runners are
+  `macos-15` (native Apple Silicon), `macos-15-intel` (native Intel, not
+  Rosetta), and `windows-2022` (x64), using matching 64-bit Python 3.12.
+  Each job checks runner/Python architecture, runs all tests, builds with
+  PyInstaller, and checks the packaged executable architecture. It renders
+  the packaged UI with a timeout and requires a screenshot, running from the
+  mounted, verified DMG or the extracted Windows ZIP. Download the matching
+  Actions artifact to obtain its DMG/ZIP.
+- Successful `v*` tag pushes and manual runs against `v*` tags automatically
+  publish all three packages to that tag's GitHub Release, only after every
+  build/test/smoke check passes. Branch and PR runs never publish. Only the
+  release job has `contents: write`; build jobs remain read-only. Packages
+  come from the same workflow run, and publication refuses a tag whose current
+  commit differs from the built commit. A missing release is created with
+  generated notes; an existing release keeps its title, notes, draft/prerelease
+  status and other metadata. Matching asset filenames are replaced on reruns;
+  unrelated assets are retained.
+- To rebuild/publish an **existing tag** without moving it, open **Actions →
+  Test and package → Run workflow**, select the existing `v*` tag as the run
+  ref (not a branch), and run it. If the UI does not offer a tag selector, use
+  `gh workflow run build.yml --ref v0.1.0`, substituting your tag, then monitor
+  the run in Actions. The tag must already contain this workflow version;
+  existing tags pointing to older workflows will execute those older versions.
+  Selecting a tag does not use the workflow from the latest branch. If the tag
+  lacks this workflow, merge the workflow changes and create a new version tag
+  at that merged commit instead.
+  **Do not move published tags.** Create a new version tag for source changes.
+  Rerunning the same tag replaces its package assets, so downloaded binaries
+  may differ as build dependencies evolve. Immutable releases may reject asset
+  replacement; publish a new version instead.
+- To create a local DMG after a native macOS build:
 
   ```sh
-  /path/to/intel-python -m PyInstaller --noconfirm \
-    --distpath dist/intel --workpath build/intel CrateTransfer.spec
-  ditto -c -k --sequesterRsrc --keepParent \
-    "dist/intel/Crate Transfer.app" dist/Crate-Transfer-macOS-x86_64.zip
+  mkdir -p packaging/dmg
+  ditto "dist/Crate Transfer.app" "packaging/dmg/Crate Transfer.app"
+  ln -s /Applications packaging/dmg/Applications
+  hdiutil create -volname "Crate Transfer" -srcfolder packaging/dmg \
+    -format UDZO "dist/Crate-Transfer-macOS-$(uname -m).dmg"
+  hdiutil verify "dist/Crate-Transfer-macOS-$(uname -m).dmg"
   ```
+
+  Use a fresh `packaging/dmg` staging folder for each build. For an isolated
+  Intel Python environment, pass `--distpath dist/intel --workpath build/intel`
+  to PyInstaller and stage `dist/intel/Crate Transfer.app` instead. A Rosetta
+  local build is not a substitute for the native Intel CI job.
 
 ## Format references
 

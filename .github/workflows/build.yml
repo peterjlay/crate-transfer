@@ -1,29 +1,186 @@
 name: Test and package
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   desktop:
+    name: ${{ matrix.target }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - target: macOS-arm64
+            runner: macos-15
+            python-arch: arm64
+            runner-arch: ARM64
+            machine: arm64
+            package: Crate-Transfer-macOS-arm64.dmg
+          - target: macOS-x86_64
+            runner: macos-15-intel
+            python-arch: x64
+            runner-arch: X64
+            machine: x86_64
+            package: Crate-Transfer-macOS-x86_64.dmg
+          - target: Windows-x64
+            runner: windows-2022
+            python-arch: x64
+            runner-arch: X64
+            machine: AMD64
+            package: Crate-Transfer-Windows-x64.zip
+    runs-on: ${{ matrix.runner }}
     env:
       QT_QPA_PLATFORM: offscreen
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner-arch }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      PACKAGE_NAME: ${{ matrix.package }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: ${{ matrix.python-arch }}
           cache: pip
-      - run: python -m pip install ".[build]"
-      - run: python -m unittest discover -s tests -v
-      - run: python -m crate_transfer --smoke-test --data-dir .ui-smoke
-      - run: python -m PyInstaller --noconfirm CrateTransfer.spec
+      - name: Verify native runner and Python architecture
+        shell: python
+        run: |
+          import os
+          import platform
+          import struct
+          assert os.environ["RUNNER_ARCH"] == os.environ["EXPECTED_RUNNER_ARCH"], os.environ["RUNNER_ARCH"]
+          assert platform.machine() == os.environ["EXPECTED_MACHINE"], platform.machine()
+          assert struct.calcsize("P") == 8, "Python must be 64-bit"
+          print(f"Native runner: {platform.platform()}, Python: {platform.machine()} (64-bit)")
+      - name: Install build dependencies
+        run: python -m pip install ".[build]"
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build native application
+        run: python -m PyInstaller --clean --noconfirm CrateTransfer.spec
+      - name: Create macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p packaging/dmg
+          ditto "dist/Crate Transfer.app" "packaging/dmg/Crate Transfer.app"
+          ln -s /Applications packaging/dmg/Applications
+          hdiutil create -volname "Crate Transfer" -srcfolder packaging/dmg \
+            -format UDZO "dist/$PACKAGE_NAME"
+          hdiutil verify "dist/$PACKAGE_NAME"
+          mkdir -p packaging/mounted
+          hdiutil attach "dist/$PACKAGE_NAME" -readonly -nobrowse \
+            -mountpoint "$PWD/packaging/mounted"
+      - name: Create and extract Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/Crate Transfer" -DestinationPath "dist/$env:PACKAGE_NAME"
+          Expand-Archive -Path "dist/$env:PACKAGE_NAME" -DestinationPath packaging/extracted
+      - name: Verify packaged architecture and smoke-test distributed application
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import struct
+          import subprocess
+          import sys
+
+          if sys.platform == "darwin":
+              root = Path("packaging/mounted")
+              assert (root / "Applications").is_symlink(), "Missing Applications link"
+              assert os.readlink(root / "Applications") == "/Applications"
+              executable = root / "Crate Transfer.app/Contents/MacOS/Crate Transfer"
+              architectures = subprocess.check_output(
+                  ["lipo", "-archs", str(executable)], text=True
+              ).strip()
+              assert architectures == os.environ["EXPECTED_MACHINE"], architectures
+          else:
+              executable = Path("packaging/extracted/Crate Transfer/Crate Transfer.exe")
+              with executable.open("rb") as binary:
+                  assert binary.read(2) == b"MZ", "Missing PE header"
+                  binary.seek(0x3c)
+                  offset = struct.unpack("<I", binary.read(4))[0]
+                  binary.seek(offset)
+                  assert binary.read(4) == b"PE\0\0", "Invalid PE signature"
+                  assert struct.unpack("<H", binary.read(2))[0] == 0x8664, "Not an x64 executable"
+
+          data = Path("packaging/smoke-data").resolve()
+          screenshot = Path("packaging/smoke.png").resolve()
+          subprocess.run(
+              [str(executable.resolve()), "--smoke-test", "--data-dir", str(data),
+               "--screenshot", str(screenshot)],
+              check=True, timeout=90,
+          )
+          assert screenshot.is_file() and screenshot.stat().st_size > 0, "Packaged UI did not render"
+      - name: Unmount macOS disk image
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          if mount | grep -Fq " on $PWD/packaging/mounted ("; then
+            hdiutil detach "$PWD/packaging/mounted"
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: crate-transfer-${{ matrix.os }}
-          path: dist/
+          name: Crate-Transfer-${{ matrix.target }}
+          path: dist/${{ matrix.package }}
+          if-no-files-found: error
+
+  release:
+    name: Publish tag packages
+    needs: desktop
+    if: >-
+      needs.desktop.result == 'success' &&
+      github.ref_type == 'tag' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      BUILD_SHA: ${{ github.sha }}
+    steps:
+      - name: Download packages from this run only
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Crate-Transfer-*
+          path: packages
+          merge-multiple: true
+      - name: Verify tag and publish packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(
+            packages/Crate-Transfer-macOS-arm64.dmg
+            packages/Crate-Transfer-macOS-x86_64.dmg
+            packages/Crate-Transfer-Windows-x64.zip
+          )
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          test "$(find packages -type f | wc -l)" -eq 3
+          # The commits endpoint resolves both annotated and lightweight tags to a commit.
+          tag_sha="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ "$tag_sha" != "$BUILD_SHA" ]]; then
+            echo "::error::Tag no longer points at the commit built by this run; refusing publication."
+            exit 1
+          fi
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag \
+              --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber

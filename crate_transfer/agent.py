@@ -27,6 +27,10 @@ class TransferError(RuntimeError):
     pass
 
 
+class ImportFailed(TransferError):
+    pass
+
+
 class Agent:
     def __init__(self, settings: Settings, notify=lambda: None, guard=assert_serato_closed):
         self.settings, self.notify, self.guard = settings, notify, guard
@@ -99,7 +103,7 @@ class Agent:
                 reverse_token = identifier(reverse.get("token"))
                 reverse_port = reverse.get("port")
                 if type(reverse_port) is not int or not 1024 <= reverse_port <= 65535:
-                    raise ProtocolError("Invalid sender receiver port.")
+                    raise ProtocolError("Invalid computer connection port.")
             token = secrets.token_hex(32)
             settings = self.settings.snapshot()
             settings["trusted"][peer_id] = {"name": name, "token_hash": hashlib.sha256(token.encode()).hexdigest()}
@@ -130,11 +134,11 @@ class Agent:
     def begin(self, manifest: dict, peer_id: str) -> dict:
         validate_manifest(manifest)
         if manifest["sender_id"] != peer_id:
-            raise PermissionError("Manifest sender does not match the paired computer.")
+            raise PermissionError("Manifest computer identity does not match the paired computer.")
         with self.lock:
             self._expire()
             if self.session:
-                raise TransferError("Receiver is busy. Finish or cancel its current transfer first.")
+                raise TransferError("The other computer is busy. Finish or cancel its current transfer first.")
             self.guard()
             settings = self.settings.snapshot()
             library = Library(settings["library"])
@@ -157,7 +161,7 @@ class Agent:
                             "library": library, "staging": staging, "received": set(),
                             "touched": time.monotonic()}
             self.job(session_id, direction="receive", peer=manifest["sender_name"], status="receiving",
-                     detail=f"Waiting for {len(manifest['files'])} files", progress=0)
+                     owner=peer_id, detail=f"Waiting for {len(manifest['files'])} files", progress=0)
             return {"id": session_id}
 
     def require_session(self, session_id, peer_id):
@@ -380,6 +384,12 @@ class Handler(BaseHTTPRequestHandler):
             return agent.begin(self.read_json(), peer)
         if len(parts) >= 3 and parts[:2] == ["v1", "transfers"]:
             session_id = parts[2]
+            if self.command == "GET" and len(parts) == 3:
+                job = next((job for job in agent.history()
+                            if job["id"] == session_id and job.get("owner") == peer), None)
+                if job is None:
+                    raise ProtocolError("Unknown transfer for this computer.")
+                return {key: job[key] for key in ("status", "detail", "result") if key in job}
             if self.command == "PUT" and len(parts) == 5 and parts[3] == "files":
                 agent.upload(session_id, parts[4], peer, self.body_length(), self.rfile)
                 return {"verified": True}
@@ -400,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(400, {"error": str(error)})
         except Exception:
             LOG.exception("Receiver request failed")
-            self.respond(500, {"error": "Receiver failed. See the receiver's activity and application log."})
+            self.respond(500, {"error": "Remote operation failed. See Activity and the application log on that computer."})
         else:
             self.respond(200, result)
 
@@ -415,14 +425,15 @@ class Client:
         self.host, self.port, self.token = host, port, token
         self.fingerprint = identifier(fingerprint.lower().replace(":", "").replace(" ", ""))
 
-    def request(self, method, endpoint, payload=None, file: Path | None = None, progress=lambda count: None):
-        connection = http.client.HTTPSConnection(self.host, self.port, timeout=60, context=client_context())
+    def request(self, method, endpoint, payload=None, file: Path | None = None, progress=lambda count: None,
+                timeout=60):
+        connection = http.client.HTTPSConnection(self.host, self.port, timeout=timeout, context=client_context())
         try:
             connection.connect()
             actual = hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest()
             if not hmac.compare_digest(actual, self.fingerprint):
-                raise TransferError("Receiver fingerprint does not match. No credentials or music were sent. "
-                                    "Check the receiver address, then pair again with a fresh code on a trusted network "
+                raise TransferError("Computer fingerprint does not match. No credentials or music were sent. "
+                                    "Check the computer address, then pair again with a fresh code on a trusted network "
                                     "if its identity has changed.")
             body = json.dumps(payload).encode() if payload is not None else b""
             headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
@@ -450,10 +461,10 @@ class Client:
             response = connection.getresponse()
             raw = response.read(MAX_JSON + 1)
             if len(raw) > MAX_JSON:
-                raise TransferError("Receiver response is too large.")
+                raise TransferError("Remote response is too large.")
             result = json.loads(raw)
             if response.status != 200:
-                raise TransferError(result.get("error", f"Receiver returned HTTP {response.status}"))
+                raise TransferError(result.get("error", f"The other computer returned HTTP {response.status}"))
             return result
         finally:
             connection.close()
@@ -479,7 +490,7 @@ def pair_computer(settings: Settings, host, port, fingerprint, code):
         "reverse": {"fingerprint": own_fingerprint, "token": reverse_token, "port": own["port"]},
     })
     if result.get("bidirectional") is not True:
-        raise TransferError("Receiver did not confirm send-and-receive pairing. Update both apps and pair again.")
+        raise TransferError("The other computer did not confirm send-and-receive pairing. Update both apps and pair again.")
     peer_id = machine_id(result["id"])
     own["peers"][peer_id] = {"id": peer_id, "name": label(result["name"], 100), "host": host, "port": port,
                              "fingerprint": client.fingerprint, "token": identifier(result["token"])}
@@ -493,13 +504,13 @@ def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambd
     own = agent.settings.snapshot()
     peer = own["peers"][peer_id]
     client = Client(peer["host"], peer["port"], peer["fingerprint"], peer["token"])
-    agent.job(job_id, direction="send", peer=peer["name"], status="preparing", progress=0,
+    agent.job(job_id, direction="send", peer=peer["name"], peer_id=peer_id, status="preparing", progress=0,
               detail="Reading selected crates and checking files")
     remote_id, finishing = None, False
     try:
         def check_cancelled():
             if cancelled():
-                raise TransferError("Transfer cancelled by sender. No crates imported.")
+                raise TransferError("Transfer cancelled by this computer. No crates imported.")
 
         def preparing(text):
             check_cancelled()
@@ -529,21 +540,72 @@ def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambd
             client.request("PUT", f"/v1/transfers/{remote_id}/files/{item['id']}",
                            file=paths[item["id"]], progress=progress)
         check_cancelled()
-        agent.job(job_id, status="importing", detail="Receiver is backing up and importing the crates", progress=1)
+        agent.job(job_id, status="importing", detail="The other computer is backing up and importing the crates", progress=1,
+                  remote_id=remote_id)
         finishing = True
-        result = client.request("POST", f"/v1/transfers/{remote_id}/finish")
+        try:
+            result = client.request("POST", f"/v1/transfers/{remote_id}/finish", timeout=600)
+        except (OSError, http.client.HTTPException):
+            agent.job(job_id, detail="Connection interrupted during import. Checking the other computer; do not resend.",
+                      remote_id=remote_id)
+            result = recover_receipt(client, remote_id)
         agent.job(job_id, status="complete", detail=f"{result['crates']} crates delivered. Open Serato on {peer['name']}.",
                   result=result, remote_id=remote_id)
         return result
     except Exception as error:
         LOG.exception("Transfer failed")
         detail = str(error)
-        if finishing:
-            detail += " Import outcome may be unknown; check the receiver's Activity before resending."
-        agent.job(job_id, status="uncertain" if finishing else "failed", detail=detail, remote_id=remote_id)
+        uncertain = finishing and not isinstance(error, ImportFailed)
+        if uncertain:
+            detail += " Import outcome may be unknown; check Activity on the other computer before resending."
+        agent.job(job_id, status="uncertain" if uncertain else "failed", detail=detail, remote_id=remote_id)
         if remote_id and not finishing:
             try:
                 client.request("DELETE", f"/v1/transfers/{remote_id}")
             except Exception:
                 LOG.exception("Could not cancel remote receive session; cancel it on the receiver")
         raise
+
+
+def recover_receipt(client: Client, remote_id: str, wait_seconds=600):
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            status = client.request("GET", f"/v1/transfers/{remote_id}", timeout=10)
+        except (OSError, http.client.HTTPException) as error:
+            LOG.warning("Could not check remote import outcome: %s", error)
+        else:
+            if status["status"] == "complete":
+                return status["result"]
+            if status["status"] == "failed":
+                raise ImportFailed(status["detail"])
+            if status["status"] == "uncertain":
+                raise TransferError(status["detail"])
+        if time.monotonic() >= deadline:
+            raise TransferError("Could not confirm the remote import. Check Activity on the other computer before resending.")
+        time.sleep(2)
+
+
+def check_transfer(agent: Agent, job_id: str):
+    job = next(job for job in agent.history() if job["id"] == job_id)
+    if job.get("direction") != "send" or not job.get("remote_id") or job["status"] != "uncertain":
+        raise TransferError("Select an uncertain outgoing transfer with a remote transfer ID.")
+    peers = agent.settings.snapshot()["peers"]
+    peer_id = job.get("peer_id")
+    if peer_id is None:
+        matches = [key for key, peer in peers.items() if peer["name"] == job["peer"]]
+        if len(matches) != 1:
+            raise TransferError("Cannot uniquely identify the paired computer for this older transfer.")
+        peer_id = matches[0]
+    if peer_id not in peers:
+        raise TransferError("Pair with the original computer again before checking this transfer.")
+    peer = peers[peer_id]
+    try:
+        receipt = recover_receipt(Client(peer["host"], peer["port"], peer["fingerprint"], peer["token"]),
+                                  job["remote_id"], wait_seconds=0)
+    except ImportFailed as error:
+        agent.job(job_id, status="failed", detail=str(error))
+        raise
+    agent.job(job_id, status="complete", progress=1, result=receipt,
+              detail=f"Confirmed {receipt['crates']} crates delivered. No files were resent.")
+    return receipt

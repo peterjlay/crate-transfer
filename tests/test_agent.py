@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from crate_transfer.agent import Agent, Client, TransferError, pair_computer, send_crates
+from crate_transfer.agent import Agent, Client, TransferError, check_transfer, pair_computer, recover_receipt, send_crates
 from crate_transfer.config import Settings, atomic_json
 from crate_transfer.identity import client_context
 from crate_transfer.library import LibraryError, portable_path
@@ -84,7 +84,7 @@ class AgentTests(unittest.TestCase):
         self.assertIsNone(guarded.session)
 
         session_id = agent.begin(manifest, manifest["sender_id"])["id"]
-        with self.assertRaisesRegex(TransferError, "Receiver is busy"):
+        with self.assertRaisesRegex(TransferError, "computer is busy"):
             agent.begin(manifest, manifest["sender_id"])
         staging = agent.session["staging"]
         agent.cancel(session_id, manifest["sender_id"])
@@ -190,6 +190,57 @@ class AgentTests(unittest.TestCase):
         second_result = agent.finish(session_id, peer)
         self.assertEqual(second_result, result)
         self.assertEqual(sum(job["status"] == "complete" for job in agent.history()), 1)
+
+    def test_receipt_recovery_polls_transient_disconnect_without_resending_import(self):
+        client = Client("127.0.0.1", 49783, "a" * 64, "token")
+        receipt = {"crates": 1, "files": 25}
+        with patch.object(client, "request", side_effect=[
+                TimeoutError("network interrupted"), {"status": "importing"},
+                {"status": "complete", "result": receipt}]) as request, \
+                patch("crate_transfer.agent.time.sleep") as sleep:
+            self.assertEqual(recover_receipt(client, "transfer"), receipt)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(all(call.args == ("GET", "/v1/transfers/transfer") for call in request.call_args_list))
+
+    def test_receipt_recovery_timeout_and_remote_failure_are_not_success(self):
+        client = Client("127.0.0.1", 49783, "a" * 64)
+        with patch.object(client, "request", return_value={"status": "importing"}):
+            with self.assertRaisesRegex(TransferError, "Could not confirm"):
+                recover_receipt(client, "transfer", wait_seconds=0)
+        with patch.object(client, "request", return_value={"status": "failed", "detail": "Disk full"}):
+            with self.assertRaisesRegex(TransferError, "Disk full"):
+                recover_receipt(client, "transfer", wait_seconds=0)
+
+    def test_check_uncertain_transfer_queries_receipt_without_resending_files(self):
+        agent, settings, _, _ = self.make_receiver()
+        settings.update(peers={PEER_ID: {"id": PEER_ID, "name": "Other Computer", "host": "127.0.0.1",
+                                        "port": 49783, "fingerprint": "a" * 64, "token": "token"}})
+        agent.job("job", direction="send", status="uncertain", peer="Other Computer",
+                  remote_id="remote", detail="Import outcome unknown")
+        with patch("crate_transfer.agent.Client.request",
+                   return_value={"status": "complete", "result": {"crates": 1}}) as request:
+            self.assertEqual(check_transfer(agent, "job"), {"crates": 1})
+        request.assert_called_once_with("GET", "/v1/transfers/remote", timeout=10)
+        self.assertEqual(agent.history()[0]["status"], "complete")
+        self.assertIn("No files were resent", agent.history()[0]["detail"])
+
+    def test_transfer_status_requires_owner_and_survives_restart(self):
+        agent, settings, _, _ = self.make_receiver()
+        first = agent.pair({"code": agent.pairing(), "id": PEER_ID, "name": "First"})["token"]
+        second = agent.pair({"code": agent.pairing(), "id": OTHER_ID, "name": "Second"})["token"]
+        manifest, record, content = self.make_manifest()
+        manifest["sender_id"] = PEER_ID
+        session = agent.begin(manifest, PEER_ID)["id"]
+        agent.upload(session, record["id"], PEER_ID, len(content), io.BytesIO(content))
+        receipt = agent.finish(session, PEER_ID)
+        restarted = Agent(Settings(settings.directory), guard=lambda: None)
+        port = restarted.start("127.0.0.1", 0)
+        self.addCleanup(restarted.stop)
+        self.assertEqual(Client("127.0.0.1", port, agent.fingerprint, first).request(
+            "GET", f"/v1/transfers/{session}")["result"], receipt)
+        with self.assertRaisesRegex(TransferError, "Unknown transfer"):
+            Client("127.0.0.1", port, agent.fingerprint, second).request("GET", f"/v1/transfers/{session}")
 
     def test_empty_crate_imports_without_sending_any_files(self):
         agent, _, library, _ = self.make_receiver()
@@ -310,7 +361,7 @@ class AgentTests(unittest.TestCase):
         sender = Agent(settings, guard=lambda: None)
         with self.assertLogs("crate_transfer.agent", level="ERROR"):
             with patch("crate_transfer.agent.Client.request") as request:
-                with self.assertRaisesRegex(TransferError, "cancelled by sender"):
+                with self.assertRaisesRegex(TransferError, "cancelled by this computer"):
                     send_crates(sender, [10], PEER_ID, cancelled=lambda: True)
                 request.assert_not_called()
         self.assertEqual(sender.history()[0]["status"], "failed")
@@ -475,7 +526,20 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(reverse_peer["host"], "127.0.0.1")
         self.assertEqual(sender.authorize(reverse_peer["token"]), peer_id)
 
-        receipt = send_crates(sender, [10], peer_id)
+        original_request = Client.request
+        finish_calls = []
+
+        def lose_finish_response(client, method, endpoint, *args, **kwargs):
+            result = original_request(client, method, endpoint, *args, **kwargs)
+            if endpoint.endswith("/finish"):
+                finish_calls.append(endpoint)
+                self.assertEqual(kwargs["timeout"], 600)
+                raise TimeoutError("Simulated lost final response after successful import")
+            return result
+
+        with patch.object(Client, "request", new=lose_finish_response):
+            receipt = send_crates(sender, [10], peer_id)
+        self.assertEqual(len(finish_calls), 1)
         self.assertEqual(receipt["crates"], 1)
         self.assertEqual(receipt["files"], 1)
         self.assertEqual(receipt["memberships"], 1)

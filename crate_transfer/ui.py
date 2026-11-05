@@ -16,11 +16,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .agent import Agent, pair_computer, send_crates
+from .agent import Agent, check_transfer, pair_computer, send_crates
 from .config import Settings
 from .discovery import Discovery
 from .library import Library
 from .protocol import label
+from . import startup
 
 LOG = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ QLabel { background: transparent; }
 QLabel#title { font-size: 27px; font-weight: 700; }
 QLabel#subtitle, QLabel#muted { color: #929eaf; }
 QLabel#eyebrow { color: #7de2c4; font-weight: 700; font-size: 11px; }
+QLabel[state="success"], QLabel#muted[state="success"] { color: #62e89f; font-weight: 700; }
+QLabel[state="error"], QLabel#muted[state="error"] { color: #ff737d; font-weight: 700; }
+QLabel[state="neutral"], QLabel#muted[state="neutral"] { color: #929eaf; font-weight: 400; }
 QFrame#card { background: #191e26; border: 1px solid #2b3340; border-radius: 12px; }
 QFrame#card QLabel, QWidget#pathField { background: transparent; }
 QMenu { background: #1e2631; color: #e8ecf1; border: 1px solid #53677f; padding: 5px; }
@@ -87,6 +91,12 @@ def text(value, object_name=None, wrap=False):
     return widget
 
 
+def status_style(widget, state):
+    widget.setProperty("state", state)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
 def button(value, callback, primary=False):
     widget = QPushButton(value)
     if primary:
@@ -113,11 +123,11 @@ class Bridge(QObject):
 class PairDialog(QDialog):
     def __init__(self, parent, candidate=None):
         super().__init__(parent)
-        self.setWindowTitle("Pair a receiving computer")
+        self.setWindowTitle("Pair a computer")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
         layout.addWidget(text("One-time pairing", "title"))
-        layout.addWidget(text("On the receiver, click Allow pairing, then enter its 6-digit code here. "
+        layout.addWidget(text("On the other computer, click Allow pairing, then enter its 6-digit PIN here. "
                               "Use a trusted private network for this first connection. Pairing grants this computer "
                               "permission to send and receive crates in both directions while the apps are running.",
                               "muted", True))
@@ -132,7 +142,7 @@ class PairDialog(QDialog):
         self.code.setMaxLength(6)
         self.code.setPlaceholderText("123456")
         for caption, widget in (("Host / IP address", self.host), ("Port", self.port),
-                                ("Pairing code", self.code)):
+                                ("Pairing PIN", self.code)):
             form.addRow(caption, widget)
         layout.addLayout(form)
         self.error = text("", "muted", True)
@@ -150,7 +160,7 @@ class PairDialog(QDialog):
             raise ValueError("Enter the receiving computer's hostname or IPv4 address, not a URL.")
         code = self.code.text().strip()
         if not code.isascii() or not code.isdigit() or len(code) != 6:
-            raise ValueError("Enter the receiver's 6-digit pairing code.")
+            raise ValueError("Enter the other computer's 6-digit pairing code (PIN).")
         return host, self.port.value(), None, code
 
 
@@ -179,7 +189,7 @@ class Window(QMainWindow):
         self.setMinimumSize(980, 650)
         self.build()
         self.tray = QSystemTrayIcon(app_icon(), self)
-        self.tray.setToolTip("Crate Transfer - paired LAN receiver")
+        self.tray.setToolTip("Crate Transfer - paired LAN agent")
         menu = QMenu()
         menu.addAction("Open Crate Transfer", self.show_window)
         menu.addAction("Quit", self.quit)
@@ -191,10 +201,12 @@ class Window(QMainWindow):
         if start_services:
             try:
                 self.port = self.agent.start()
-                self.receiver_status.setText(f"Receiver online  /  TLS :{self.port}")
+                self.receiver_status.setText(f"Agent online  /  TLS :{self.port}")
+                status_style(self.receiver_status, "success")
             except OSError as error:
-                self.receiver_status.setText("Receiver offline")
-                QTimer.singleShot(0, lambda message=str(error): self.show_error("Receiver could not start", message))
+                self.receiver_status.setText("Agent offline")
+                status_style(self.receiver_status, "error")
+                QTimer.singleShot(0, lambda message=str(error): self.show_error("Agent could not start", message))
             else:
                 try:
                     self.discovery = Discovery(settings.snapshot(), self.port, self.agent.fingerprint,
@@ -202,8 +214,9 @@ class Window(QMainWindow):
                 except Exception as error:
                     LOG.exception("Network discovery failed")
                     self.network_status.setText(f"Discovery unavailable: {error}. Use Pair by address.")
+                    status_style(self.network_status, "error")
         else:
-            self.receiver_status.setText("UI test mode / receiver not started")
+            self.receiver_status.setText("UI test mode / agent not started")
         self.refresh_computers()
         self.refresh_activity()
         self.timer = QTimer(self)
@@ -258,7 +271,7 @@ class Window(QMainWindow):
             side.addWidget(nav)
         side.addStretch()
         side.addWidget(text("LOCAL NETWORK ONLY", "eyebrow"))
-        self.receiver_status = text("Starting receiver...", "muted", True)
+        self.receiver_status = text("Starting agent...", "muted", True)
         side.addWidget(self.receiver_status)
         side.addWidget(text("Manual transfers. Never sync.", "muted", True))
         layout.addWidget(sidebar)
@@ -291,7 +304,7 @@ class Window(QMainWindow):
         banner, content = card()
         content.addWidget(text("SERATO DJ 4 LIBRARY", "eyebrow"))
         content.addWidget(text("Original files. Local paths. Nothing overwritten.", wrap=True))
-        content.addWidget(text("Subcrates are included when you select a parent. The receiver imports into a new "
+        content.addWidget(text("Subcrates are included when you select a parent. The other computer preserves "
                                "original crate names. Quit Serato on that computer first.", "muted", True))
         layout.addWidget(banner)
         toolbar = QHBoxLayout()
@@ -347,13 +360,13 @@ class Window(QMainWindow):
         toolbar.addWidget(button("Pair by address", lambda: self.pair_dialog()))
         layout.addLayout(toolbar)
         self.computers = QTreeWidget()
-        self.computers.setHeaderLabels(["Computer", "Address", "Access"])
+        self.computers.setHeaderLabels(["Computer", "Address", "Access", "Connection"])
         self.computers.setColumnWidth(0, 230)
         self.computers.setColumnWidth(1, 200)
         self.computers.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.computers, 1)
         controls = QHBoxLayout()
-        controls.addWidget(button("Pair selected receiver", self.pair_selected))
+        controls.addWidget(button("Pair selected computer", self.pair_selected))
         controls.addWidget(button("Forget / revoke selected", self.revoke))
         controls.addStretch()
         layout.addLayout(controls)
@@ -386,6 +399,7 @@ class Window(QMainWindow):
         self.cancel_send_button.setEnabled(False)
         controls.addWidget(self.cancel_send_button)
         controls.addWidget(button("Cancel pending receive", self.cancel_receive))
+        controls.addWidget(button("Check uncertain transfer", self.check_selected_transfer))
         controls.addStretch()
         layout.addLayout(controls)
         return widget
@@ -407,19 +421,26 @@ class Window(QMainWindow):
         self.port_input = QSpinBox()
         self.port_input.setRange(1024, 65535)
         self.port_input.setValue(self.settings.snapshot()["port"])
-        form.addRow("Receiver TCP port", self.port_input)
+        form.addRow("Agent TCP port", self.port_input)
+        self.startup_input = QCheckBox("Launch at login (quietly in the menu bar / system tray)")
+        try:
+            self.startup_input.setChecked(startup.enabled())
+        except OSError as error:
+            LOG.exception("Could not read login startup setting")
+            QTimer.singleShot(0, lambda message=str(error): self.show_error("Could not read startup setting", message))
+        form.addRow("Startup", self.startup_input)
         content.addLayout(form)
         content.addWidget(text("Choose the Serato folder or its Library subfolder, which contains root.sqlite and master.sqlite. Defaults are detected for macOS "
                                "and Windows. Received music must be on the same local volume as this Library.", "muted", True))
-        content.addWidget(text("Files keep their original names inside content-addressed folders. Shared tracks are reused "
+        content.addWidget(text("Files use readable crate folders. Shared tracks are reused "
                                "only after checksum verification. Existing music and crates are never replaced.", "muted", True))
         self.save_button = button("Save settings", self.save_settings, True)
         content.addWidget(self.save_button)
         layout.addWidget(box)
         layout.addWidget(text("AGENT BEHAVIOR", "eyebrow"))
-        layout.addWidget(text("Closing this window leaves the receiver in the menu bar / system tray. "
-                              "Use Quit to stop it. To receive after signing in, add the packaged app to Login Items "
-                              "(macOS) or Startup apps (Windows).", "muted", True))
+        layout.addWidget(text("Closing this window leaves the agent online in the menu bar / system tray. "
+                              "Use Quit to stop it. Launch at login is optional and takes effect at your next login. "
+                              "On macOS, install the app in Applications first.", "muted", True))
         layout.addWidget(text("This app does not synchronize, watch music folders, delete remote files, or use a cloud service. "
                               "Normal local-file crates are supported; smart-crate rules and streaming tracks are not transferred.",
                               "muted", True))
@@ -469,6 +490,7 @@ class Window(QMainWindow):
             self.crates_loaded = crates is not None
             if crates is None:
                 self.library_status.setText("Library unavailable. Check Settings, then refresh.")
+                status_style(self.library_status, "error")
                 self.selection_changed()
                 return
             nodes = {}
@@ -488,6 +510,7 @@ class Window(QMainWindow):
                 nodes[path].setToolTip(0, " / ".join(crate["path"]))
             self.crate_tree.expandToDepth(0)
             self.library_status.setText(f"{len(crates)} normal crates / Serato 4 SQLite library / source files stay untouched")
+            status_style(self.library_status, "neutral")
             self.filter_crates()
             self.selection_changed()
 
@@ -552,11 +575,13 @@ class Window(QMainWindow):
 
     def allow_pairing(self):
         code = self.agent.pairing()
-        self.pairing_status.setText(f"Code {code} / 120 seconds")
+        self.pairing_status.setText(f"PIN {code} / 120 seconds")
+        status_style(self.pairing_status, "success")
 
     def tick(self):
         remaining = max(0, int(self.agent.pair_until - time.monotonic()))
-        self.pairing_status.setText(f"Code {self.agent.pair_code} / {remaining}s" if remaining else "Pairing is closed")
+        self.pairing_status.setText(f"PIN {self.agent.pair_code} / {remaining}s" if remaining else "Pairing is closed")
+        status_style(self.pairing_status, "success" if remaining else "neutral")
         own = self.settings.snapshot()
         state = (own["peers"], own["trusted"])
         if state != getattr(self, "last_pairing_state", None):
@@ -578,7 +603,7 @@ class Window(QMainWindow):
             self.settings.update(peers=peers)
         selected_id = self.target.currentData()
         self.target.clear()
-        self.target.addItem("Choose receiver...", None)
+        self.target.addItem("Choose computer...", None)
         self.computers.clear()
         for key in sorted(set(discovered) | set(peers) | set(own["trusted"]),
                           key=lambda value: (peers.get(value) or discovered.get(value) or own["trusted"][value])["name"].casefold()):
@@ -591,8 +616,20 @@ class Window(QMainWindow):
                 access.append("Can receive from")
             if not access:
                 access.append("Not paired")
+            candidate = discovered.get(key)
+            online = candidate is not None and (key not in peers or candidate["fingerprint"] == peers[key]["fingerprint"])
+            connection = "Online" if online else "Not discovered"
+            if candidate and key in peers and not online:
+                connection = "Identity changed - pair again"
             address = f"{peer.get('host', 'Address not discovered')}:{peer.get('port', '')}"
-            item = QTreeWidgetItem([peer["name"], address, " / ".join(access)])
+            item = QTreeWidgetItem([peer["name"], address, " / ".join(access), connection])
+            if online or connection.startswith("Identity changed"):
+                item.setForeground(3, QColor("#62e89f" if online else "#ff737d"))
+                font = item.font(3)
+                font.setBold(True)
+                item.setFont(3, font)
+            item.setToolTip(3, "LAN discovery presence; certificate verification is enforced when connecting. "
+                              "Not discovered can mean offline or multicast blocked; manual addressing still works.")
             item.setData(0, Qt.ItemDataRole.UserRole, {**peer, "id": key})
             self.computers.addTopLevelItem(item)
         index = self.target.findData(selected_id)
@@ -603,7 +640,7 @@ class Window(QMainWindow):
     def pair_selected(self):
         item = self.computers.currentItem()
         if item is None:
-            self.show_error("Choose a computer", "Select a discovered receiver, or use Pair by address.")
+            self.show_error("Choose a computer", "Select a discovered computer, or use Pair by address.")
             return
         self.pair_dialog(item.data(0, Qt.ItemDataRole.UserRole))
 
@@ -647,6 +684,11 @@ class Window(QMainWindow):
             item = QTreeWidgetItem([f"{job.get('direction', 'transfer').capitalize()} / {timestamp}",
                                     job.get("peer", ""), job["status"].capitalize()])
             item.setData(0, Qt.ItemDataRole.UserRole, job)
+            if job["status"] in ("failed", "uncertain", "complete"):
+                item.setForeground(2, QColor("#62e89f" if job["status"] == "complete" else "#ff737d"))
+                font = item.font(2)
+                font.setBold(True)
+                item.setFont(2, font)
             self.activities.addTopLevelItem(item)
             if selected_id == job["id"] or (selected_id is None and self.activities.topLevelItemCount() == 1):
                 self.activities.setCurrentItem(item)
@@ -659,8 +701,18 @@ class Window(QMainWindow):
         self.job_progress.setValue(int(job.get("progress", 0) * 1000))
         detail = job.get("detail", "")
         if job.get("result", {}).get("backup"):
-            detail += "\nBackup on receiver: " + job["result"]["backup"]
+            detail += "\nBackup on destination computer: " + job["result"]["backup"]
         self.job_detail.setText(detail)
+        status_style(self.job_detail, "error" if job["status"] in ("failed", "uncertain") else
+                     "success" if job["status"] == "complete" else "neutral")
+
+    def check_selected_transfer(self):
+        current = self.activities.currentItem()
+        if current is None:
+            self.show_error("Select a transfer", "Select an uncertain outgoing transfer to check its outcome.")
+            return
+        job = current.data(0, Qt.ItemDataRole.UserRole)
+        self.run_task(lambda: check_transfer(self.agent, job["id"]))
 
     def cancel_receive(self):
         # A session only changes under the agent lock. Cancellation is queued
@@ -687,6 +739,8 @@ class Window(QMainWindow):
             resolved_library = Library(library)
             resolved_library.validate_destination(music)
             restart = name != self.settings.snapshot()["name"] or self.port_input.value() != self.settings.snapshot()["port"]
+            if self.startup_input.isChecked() != startup.enabled():
+                startup.configure(self.startup_input.isChecked(), self.settings.directory)
             self.settings.update(name=name, library=str(resolved_library.directory), music=str(music.resolve()), port=self.port_input.value())
         except (ValueError, OSError) as error:
             self.show_error("Settings were not saved", str(error))
@@ -701,7 +755,10 @@ class Window(QMainWindow):
                                 if restart else "Settings saved. Incoming transfers will use your chosen music folder.")
 
     def show_error(self, title, message):
-        QMessageBox.warning(self, title, message)
+        dialog = QMessageBox(QMessageBox.Icon.Warning, title, message, QMessageBox.StandardButton.Ok, self)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setStyleSheet("QLabel { color: #ff737d; font-weight: 700; }")
+        dialog.exec()
 
     def open_folder(self, path):
         path = path.expanduser()
