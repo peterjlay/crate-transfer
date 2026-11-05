@@ -1,4 +1,5 @@
 import hashlib
+from contextlib import closing
 import http.client
 import io
 import json
@@ -305,7 +306,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual((music / "Live Set/Warmup/same.mp3").read_bytes(), b"first")
         self.assertEqual((music / "Live Set/Warmup/same (2).mp3").read_bytes(), b"second")
         self.assertEqual(len(list(music.rglob("*.mp3"))), 2)
-        with sqlite3.connect(library / "root.sqlite") as db:
+        with closing(sqlite3.connect(library / "root.sqlite")) as db:
             names = [row[0] for row in db.execute("SELECT name FROM container WHERE parent_id=1")]
             children = db.execute(
                 "SELECT p.name,c.name FROM container c JOIN container p ON c.parent_id=p.id "
@@ -476,7 +477,7 @@ class AgentTests(unittest.TestCase):
         received = [path for path in Path(first.settings.snapshot()["music"]).rglob("*") if path.name == filename]
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0].read_bytes(), b"ID3-track-2")
-        with sqlite3.connect(Path(first.settings.snapshot()["library"]) / "root.sqlite") as db:
+        with closing(sqlite3.connect(Path(first.settings.snapshot()["library"]) / "root.sqlite")) as db:
             row = db.execute("SELECT type,format,portable_id FROM asset WHERE file_name=?", (filename,)).fetchone()
         self.assertEqual(row, ("video", "mpg", portable_path(str(received[0].resolve()), sys.platform == "win32")))
         for receiver in agents:

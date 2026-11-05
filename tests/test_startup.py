@@ -2,7 +2,7 @@ import plistlib
 import tempfile
 import unittest
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
 from crate_transfer import startup
@@ -30,10 +30,10 @@ class StartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             directory = home / "settings with spaces"
+            command = ["/Applications/Crate Transfer.app/Contents/MacOS/Crate Transfer",
+                       "--background", "--data-dir", str(directory.resolve())]
             with patch("crate_transfer.startup.sys.platform", "darwin"), \
-                    patch("crate_transfer.startup.sys.frozen", True, create=True), \
-                    patch("crate_transfer.startup.sys.executable",
-                          "/Applications/Crate Transfer.app/Contents/MacOS/Crate Transfer"), \
+                    patch("crate_transfer.startup.startup_command", return_value=command) as make_command, \
                     patch("crate_transfer.startup.Path.home", return_value=home):
                 self.assertFalse(startup.enabled())
                 startup.configure(True, directory)
@@ -45,9 +45,24 @@ class StartupTests(unittest.TestCase):
                     "--background", "--data-dir", str(directory.resolve())])
                 self.assertTrue(value["RunAtLoad"])
                 self.assertNotIn("KeepAlive", value)
+                make_command.assert_called_once_with(directory)
                 startup.configure(False, directory)
                 self.assertFalse(startup.enabled())
                 startup.configure(False, directory)
+
+    def test_installed_macos_startup_command_preserves_application_and_settings_paths(self):
+        executable = "/Applications/Crate Transfer.app/Contents/MacOS/Crate Transfer"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "settings with spaces"
+            expected_directory = str(directory.resolve())
+            with patch("crate_transfer.startup.sys.platform", "darwin"), \
+                    patch("crate_transfer.startup.sys.frozen", True, create=True), \
+                    patch("crate_transfer.startup.sys.executable", executable), \
+                    patch("crate_transfer.startup.Path") as executable_path:
+                executable_path.return_value.resolve.return_value = PurePosixPath(executable)
+                self.assertEqual(startup.startup_command(directory),
+                                 [executable, "--background", "--data-dir", expected_directory])
+                executable_path.assert_called_once_with(executable)
 
     def test_startup_rejects_development_and_uninstalled_macos_apps(self):
         with patch("crate_transfer.startup.sys.frozen", False, create=True):
