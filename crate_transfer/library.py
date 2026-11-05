@@ -195,7 +195,7 @@ def assert_serato_closed() -> None:
         try:
             name = (process.info["name"] or "").lower()
             if name.startswith(("serato dj pro", "serato dj lite")):
-                raise LibraryError("Quit Serato DJ on the receiving computer before importing.")
+                raise LibraryError("Quit Serato DJ on the computer getting the crates before importing.")
         except psutil.NoSuchProcess:
             continue
         except psutil.AccessDenied as error:

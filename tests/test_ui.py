@@ -252,14 +252,58 @@ class DesktopTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.window.activities.topLevelItem(0).text(2), "Complete")
         self.assertEqual(self.window.job_progress.value(), 1000)
-        self.assertIn("Backup on receiver:", self.window.job_detail.text())
+        self.assertIn("Backup on destination computer:", self.window.job_detail.text())
         self.window.agent.job("b" * 32, direction="send", peer="Receiver", status="failed",
                               detail="Checksum failed", progress=0.5)
         self.app.processEvents()
         self.window.activities.setCurrentItem(self.window.activities.topLevelItem(0))
         self.assertEqual(self.window.job_detail.text(), "Checksum failed")
         self.assertEqual(self.window.job_progress.value(), 500)
+        self.assertEqual(self.window.job_detail.property("state"), "error")
+        self.assertEqual(self.window.activities.topLevelItem(0).foreground(2).color(), QColor("#ff737d"))
+        self.assertTrue(self.window.activities.topLevelItem(0).font(2).bold())
         self.assertEqual([job["status"] for job in self.window.agent.history()], ["failed", "complete"])
+
+    def test_pairing_pin_is_bold_green_and_expiry_returns_to_neutral(self):
+        self.window.allow_pairing()
+        self.app.processEvents()
+        self.assertIn("PIN " + self.window.agent.pair_code, self.window.pairing_status.text())
+        self.assertEqual(self.window.pairing_status.palette().color(self.window.pairing_status.foregroundRole()),
+                         QColor("#62e89f"))
+        self.assertTrue(self.window.pairing_status.font().bold())
+        self.window.agent.pair_until = 0
+        self.window.tick()
+        self.assertEqual(self.window.pairing_status.property("state"), "neutral")
+
+    def test_matching_discovered_peer_has_bold_green_connection_status(self):
+        from types import SimpleNamespace
+        peer_id = "22222222-2222-4222-8222-222222222222"
+        peer = {"id": peer_id, "name": "Other Computer", "host": "192.168.1.20",
+                "port": 49783, "fingerprint": "a" * 64, "token": "b" * 64}
+        self.settings.update(peers={peer_id: peer})
+        discovered = dict(peer)
+        discovery = SimpleNamespace(snapshot=lambda: [discovered])
+        self.window.discovery = discovery
+        try:
+            self.window.refresh_computers()
+            item = self.window.computers.topLevelItem(0)
+            self.assertEqual(item.text(3), "Online")
+            self.assertEqual(item.foreground(3).color(), QColor("#62e89f"))
+            self.assertTrue(item.font(3).bold())
+            discovered["fingerprint"] = "c" * 64
+            self.window.refresh_computers()
+            item = self.window.computers.topLevelItem(0)
+            self.assertEqual(item.text(3), "Identity changed - pair again")
+            self.assertEqual(item.foreground(3).color(), QColor("#ff737d"))
+        finally:
+            self.window.discovery = None
+
+    def test_startup_registration_error_is_visible_and_settings_are_not_saved(self):
+        self.window.startup_input.setChecked(True)
+        with patch("crate_transfer.ui.startup.enabled", return_value=False), \
+                patch("crate_transfer.ui.startup.configure", side_effect=OSError("Startup access denied")):
+            self.window.save_settings()
+        self.assertIn("Startup access denied", self.errors[-1][1])
 
 
 if __name__ == "__main__":
