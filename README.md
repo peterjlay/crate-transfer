@@ -79,6 +79,13 @@ Each folder field has a **Copy** button that copies its complete path, even
 when the field is scrolled or only part of its text is selected. Standard
 text selection, Copy/Paste context menus, and keyboard shortcuts also work.
 
+On Windows, socket error **10013** means Windows denied the agent's listening
+port; a reserved range, another service, or security policy can cause this.
+Check reservations with `netsh interface ipv4 show excludedportrange protocol=tcp`.
+Choose an available **Agent TCP port** in Settings (for example 48783), save,
+and restart. Bonjour advertises the chosen port; manual pairing must use it.
+Do not disable the firewall or run as administrator as a workaround.
+
 Source absolute paths are **not sent to or reused on the destination computer**.
 A received file is stored as:
 

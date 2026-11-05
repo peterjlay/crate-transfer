@@ -42,6 +42,19 @@ class AgentTests(unittest.TestCase):
         record = file_record("track.mp3", content)
         return valid_manifest([record]), record, content
 
+    def test_windows_reserved_port_error_reports_action_without_changing_port(self):
+        agent, settings, _, _ = self.make_receiver()
+        denied = OSError("Socket access denied")
+        denied.winerror = 10013
+        with patch("crate_transfer.agent.Server", side_effect=denied):
+            with self.assertRaisesRegex(OSError, "TCP port 49783.*WinError 10013") as raised:
+                agent.start()
+        self.assertIn("48783", str(raised.exception))
+        self.assertIn("netsh interface ipv4", str(raised.exception))
+        self.assertIs(raised.exception.__cause__, denied)
+        self.assertIsNone(agent.server)
+        self.assertEqual(settings.snapshot()["port"], 49783)
+
     def test_pairing_code_attempt_limit_expiry_and_successful_token_revocation(self):
         agent, settings, _, _ = self.make_receiver()
         code = agent.pairing()

@@ -28,6 +28,7 @@ executable = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="assets/CrateTransfer.ico" if sys.platform == "win32" else None,
 )
 collection = COLLECT(
     executable,

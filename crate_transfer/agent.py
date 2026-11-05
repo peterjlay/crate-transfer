@@ -291,7 +291,20 @@ class Agent:
             self.session = None
 
     def start(self, host="0.0.0.0", port=None):
-        self.server = Server((host, self.settings.snapshot()["port"] if port is None else port), Handler)
+        port = self.settings.snapshot()["port"] if port is None else port
+        try:
+            self.server = Server((host, port), Handler)
+        except OSError as error:
+            LOG.exception("Could not listen on %s:%s", host, port)
+            if getattr(error, "winerror", None) == 10013:
+                raise OSError(
+                    f"Windows denied access to TCP port {port} (WinError 10013). "
+                    "The port may be reserved by Windows, held by another service, or blocked by security policy. "
+                    "In Settings, choose another Agent TCP port (for example 48783), save, then restart the app. "
+                    "Check reserved ports with: netsh interface ipv4 show excludedportrange protocol=tcp. "
+                    "Do not disable your firewall or run as administrator to bypass this."
+                ) from error
+            raise
         self.server.agent = self
         self.server.context = self.context
         threading.Thread(target=self.server.serve_forever, name="crate-receiver", daemon=True).start()
