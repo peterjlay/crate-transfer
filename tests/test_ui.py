@@ -222,6 +222,17 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("separate", self.errors[-1][1])
         self.assertEqual(self.settings.snapshot()["music"], str(destination.resolve()))
 
+    def test_connection_port_saves_without_validating_library_or_changing_other_settings(self):
+        before = self.settings.snapshot()
+        self.window.library_input.setText(str(self.base / "missing"))
+        self.window.music_input.setText("")
+        self.window.port_input.setValue(48783)
+        with patch("crate_transfer.ui.QMessageBox.information") as information:
+            self.window.save_connection_port()
+        self.assertEqual(self.errors, [])
+        self.assertEqual(Settings(self.settings.directory).snapshot(), dict(before, port=48783))
+        information.assert_called_once()
+
     def test_settings_accept_serato_parent_and_persist_resolved_library_folder(self):
         parent = self.base / "Application Support" / "Serato"
         library = parent / "Library"

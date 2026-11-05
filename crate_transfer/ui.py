@@ -422,6 +422,7 @@ class Window(QMainWindow):
         self.port_input.setRange(1024, 65535)
         self.port_input.setValue(self.settings.snapshot()["port"])
         form.addRow("Agent TCP port", self.port_input)
+        form.addRow("", button("Save connection port", self.save_connection_port))
         self.startup_input = QCheckBox("Launch at login (quietly in the menu bar / system tray)")
         try:
             self.startup_input.setChecked(startup.enabled())
@@ -723,6 +724,21 @@ class Window(QMainWindow):
             return
         session_id, peer = session["id"], session["peer"]
         self.run_task(lambda: self.agent.cancel(session_id, peer))
+
+    def save_connection_port(self):
+        if self.sending or self.agent.session:
+            self.show_error("Transfer in progress", "Finish or cancel transfers before changing the connection port.")
+            return
+        try:
+            self.settings.update(port=self.port_input.value())
+        except OSError as error:
+            self.show_error("Connection port was not saved", str(error))
+            return
+        QMessageBox.information(
+            self, "Connection port saved",
+            f"TCP port {self.port_input.value()} saved. Quit the agent from its tray menu and reopen it to apply. "
+            "Library folders and startup settings were not changed.",
+        )
 
     def save_settings(self):
         if self.active_tasks or self.agent.session:

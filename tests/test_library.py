@@ -7,7 +7,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import psutil
 
@@ -15,9 +15,11 @@ from crate_transfer.library import (
     Library,
     LibraryError,
     assert_serato_closed,
+    backup_database,
     check_root,
     connect,
     portable_path,
+    verify_backup_contents,
 )
 from support import (
     create_aggregate_database,
@@ -416,6 +418,126 @@ class LibraryTests(unittest.TestCase):
             ],
         }
         return manifest, installed, records, (first, second)
+
+    def test_import_preserves_serato_collated_aggregate_and_its_backup_indexes(self):
+        library, library_dir, music = self.make_receiver()
+        manifest, installed, _, _ = self.make_import(music)
+        master = library_dir / "master.sqlite"
+        collation = "serato_asset_string_comparator"
+
+        # Deliberately nonstandard ordering proves no guessed comparator or
+        # rebuilt index is used by the importer.
+        def reverse_compare(left, right):
+            return (right > left) - (right < left)
+
+        with closing(sqlite3.connect(master)) as db:
+            db.create_collation(collation, reverse_compare)
+            db.executescript(
+                'CREATE TABLE "sort""cache"(id INTEGER PRIMARY KEY, '
+                f'label TEXT COLLATE {collation}, payload BLOB);'
+                f'CREATE INDEX custom_sort ON "sort""cache"(label COLLATE {collation});'
+            )
+            rows = [(i, f"Track {i}", bytes([i % 256])) for i in range(257)]
+            rows.append((257, None, b"\x00\xff"))
+            db.executemany('INSERT INTO "sort""cache" VALUES (?,?,?)', rows)
+            db.commit()
+            expected_order = db.execute(
+                'SELECT id FROM "sort""cache" ORDER BY label'
+            ).fetchall()
+        master_bytes = master.read_bytes()
+        before = root_snapshot(library_dir / "root.sqlite")
+        backup_dir = self.base / "collated-backup"
+        with self.assertLogs("crate_transfer.library", level="WARNING") as logs:
+            result = library.import_crates(manifest, installed, backup_dir, "collated",
+                                           guard=lambda: None)
+        self.assertIn("Serato-only index ordering cannot be checked", logs.output[0])
+        self.assertEqual(result["memberships"], 4)
+        self.assertEqual(root_snapshot(library_dir / "root.sqlite")["revision"], (2, 2))
+        self.assertEqual(root_snapshot(backup_dir / "root.sqlite"), before)
+        self.assertEqual(master.read_bytes(), master_bytes)
+        with closing(sqlite3.connect(backup_dir / "master.sqlite")) as db:
+            db.create_collation(collation, reverse_compare)
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+            self.assertEqual(db.execute('SELECT * FROM "sort""cache" NOT INDEXED').fetchall(), rows)
+            self.assertEqual(db.execute(
+                'SELECT id FROM "sort""cache" ORDER BY label'
+            ).fetchall(), expected_order)
+
+    def test_unknown_root_collation_stops_import_before_any_library_changes(self):
+        library, library_dir, music = self.make_receiver()
+        manifest, installed, _, _ = self.make_import(music)
+        root = library_dir / "root.sqlite"
+        with closing(sqlite3.connect(root)) as db:
+            db.create_collation("serato_asset_string_comparator",
+                                lambda left, right: (left > right) - (left < right))
+            db.execute("CREATE INDEX root_custom_sort ON asset("
+                       "file_name COLLATE serato_asset_string_comparator)")
+            db.commit()
+        before = root.read_bytes()
+        master_before = (library_dir / "master.sqlite").read_bytes()
+        with self.assertRaisesRegex(LibraryError, "Cannot validate root.sqlite backup"):
+            library.import_crates(manifest, installed, self.base / "unsupported-backup",
+                                  "unsupported", guard=lambda: None)
+        self.assertEqual(root.read_bytes(), before)
+        self.assertEqual((library_dir / "master.sqlite").read_bytes(), master_before)
+
+    def test_backup_comparison_rejects_schema_changed_rows_and_missing_or_extra_rows(self):
+        with closing(sqlite3.connect(":memory:")) as source:
+            source.row_factory = sqlite3.Row
+            source.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY, data BLOB)")
+            source.executemany("INSERT INTO sample VALUES (?,?)",
+                               [(i, bytes([i % 256])) for i in range(257)])
+            source.commit()
+            for mutation in (
+                "ALTER TABLE sample ADD COLUMN extra",
+                "UPDATE sample SET data=X'ff00' WHERE id=200",
+                "DELETE FROM sample WHERE id=256",
+                "INSERT INTO sample VALUES (257, X'01')",
+            ):
+                with self.subTest(mutation=mutation), closing(sqlite3.connect(":memory:")) as target:
+                    source.backup(target)
+                    target.execute(mutation)
+                    with self.assertRaisesRegex(LibraryError, "backup .* differs? from its source"):
+                        verify_backup_contents(source, target)
+
+    def test_master_backup_comparison_uses_the_same_wal_snapshot_as_backup(self):
+        path = self.base / "master.sqlite"
+        with closing(sqlite3.connect(path)) as writer:
+            writer.create_collation("serato_asset_string_comparator",
+                                    lambda left, right: (left > right) - (left < right))
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.executescript(
+                "CREATE TABLE sample(label TEXT);"
+                "CREATE INDEX custom_sort ON sample(label COLLATE serato_asset_string_comparator);"
+                "INSERT INTO sample VALUES ('original');"
+            )
+            with closing(connect(path)) as source, closing(sqlite3.connect(":memory:")) as target:
+                def change_original_then_compare(original, copied):
+                    writer.execute("UPDATE sample SET label='later'")
+                    writer.commit()
+                    verify_backup_contents(original, copied)
+
+                with patch("crate_transfer.library.verify_backup_contents",
+                           side_effect=change_original_then_compare), \
+                        self.assertLogs("crate_transfer.library", level="WARNING"):
+                    backup_database(source, target, "master.sqlite")
+                self.assertEqual(target.execute("SELECT label FROM sample").fetchall(), [("original",)])
+                self.assertEqual(writer.execute("SELECT label FROM sample").fetchall(), [("later",)])
+
+    def test_master_backup_does_not_ignore_other_integrity_errors(self):
+        for error in ("database disk image is malformed", "disk I/O error",
+                      "no such function: serato_str_norm"):
+            with self.subTest(error=error):
+                source, target = Mock(), Mock()
+                target.execute.side_effect = sqlite3.OperationalError(error)
+                with patch("crate_transfer.library.verify_backup_contents") as compare:
+                    with self.assertRaisesRegex(LibraryError, "Cannot validate master.sqlite backup"):
+                        backup_database(source, target, "master.sqlite")
+                compare.assert_not_called()
+        source, target = Mock(), Mock()
+        target.execute.return_value.fetchall.return_value = [("index contains wrong entries",)]
+        with self.assertRaisesRegex(LibraryError, "master.sqlite backup failed its integrity check"):
+            backup_database(source, target, "master.sqlite")
 
     def test_import_backs_up_both_databases_bumps_revisions_and_preserves_unrelated_cache(self):
         library, library_dir, music = self.make_receiver()

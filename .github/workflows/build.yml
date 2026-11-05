@@ -22,13 +22,13 @@ jobs:
             python-arch: arm64
             runner-arch: ARM64
             machine: arm64
-            package: Crate-Transfer-macOS-arm64.dmg
+            package: Crate-Transfer-macOS-arm64.zip
           - target: macOS-x86_64
             runner: macos-15-intel
             python-arch: x64
             runner-arch: X64
             machine: x86_64
-            package: Crate-Transfer-macOS-x86_64.dmg
+            package: Crate-Transfer-macOS-x86_64.zip
           - target: Windows-x64
             runner: windows-2022
             python-arch: x64
@@ -64,20 +64,17 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Build native application
         run: python -m PyInstaller --clean --noconfirm CrateTransfer.spec
-      - name: Create macOS disk image
+      - name: Create and extract macOS ZIP
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p packaging/dmg
-          ditto "dist/Crate Transfer.app" "packaging/dmg/Crate Transfer.app"
-          ln -s /Applications packaging/dmg/Applications
-          hdiutil create -volname "Crate Transfer" -srcfolder packaging/dmg \
-            -format UDZO "dist/$PACKAGE_NAME"
-          hdiutil verify "dist/$PACKAGE_NAME"
-          mkdir -p packaging/mounted
-          hdiutil attach "dist/$PACKAGE_NAME" -readonly -nobrowse \
-            -mountpoint "$PWD/packaging/mounted"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Crate Transfer.app" "dist/$PACKAGE_NAME"
+          unzip -t "dist/$PACKAGE_NAME"
+          mkdir -p packaging/extracted
+          ditto -x -k "dist/$PACKAGE_NAME" packaging/extracted
+          codesign --verify --deep --strict "packaging/extracted/Crate Transfer.app"
       - name: Create and extract Windows ZIP
         if: runner.os == 'Windows'
         shell: pwsh
@@ -94,9 +91,7 @@ jobs:
           import sys
 
           if sys.platform == "darwin":
-              root = Path("packaging/mounted")
-              assert (root / "Applications").is_symlink(), "Missing Applications link"
-              assert os.readlink(root / "Applications") == "/Applications"
+              root = Path("packaging/extracted")
               executable = root / "Crate Transfer.app/Contents/MacOS/Crate Transfer"
               architectures = subprocess.check_output(
                   ["lipo", "-archs", str(executable)], text=True
@@ -120,13 +115,6 @@ jobs:
               check=True, timeout=90,
           )
           assert screenshot.is_file() and screenshot.stat().st_size > 0, "Packaged UI did not render"
-      - name: Unmount macOS disk image
-        if: always() && runner.os == 'macOS'
-        shell: bash
-        run: |
-          if mount | grep -Fq " on $PWD/packaging/mounted ("; then
-            hdiutil detach "$PWD/packaging/mounted"
-          fi
       - uses: actions/upload-artifact@v6
         with:
           name: Crate-Transfer-${{ matrix.target }}
@@ -165,8 +153,8 @@ jobs:
         run: |
           set -euo pipefail
           assets=(
-            packages/Crate-Transfer-macOS-arm64.dmg
-            packages/Crate-Transfer-macOS-x86_64.dmg
+            packages/Crate-Transfer-macOS-arm64.zip
+            packages/Crate-Transfer-macOS-x86_64.zip
             packages/Crate-Transfer-Windows-x64.zip
           )
           for asset in "${assets[@]}"; do

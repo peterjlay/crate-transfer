@@ -9,6 +9,17 @@ from crate_transfer.identity import client_context, identity
 
 
 class SettingsTests(unittest.TestCase):
+    def test_settings_accept_powershell_utf8_bom_and_preserve_pairings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            settings = Settings(directory)
+            settings.update(port=48783, peers={"peer": {"token": "synthetic-token"}})
+            expected = settings.snapshot()
+            path = directory / "settings.json"
+            path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+            self.assertEqual(Settings(directory).snapshot(), expected)
+            self.assertFalse(path.read_bytes().startswith(b"\xef\xbb\xbf"))
+
     def test_platform_default_directories_follow_platform_and_localappdata(self):
         from crate_transfer.config import data_directory, library_directory
 
