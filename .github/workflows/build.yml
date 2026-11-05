@@ -1,0 +1,29 @@
+name: Test and package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install ".[build]"
+      - run: python -m unittest discover -s tests -v
+      - run: python -m crate_transfer --smoke-test --data-dir .ui-smoke
+      - run: python -m PyInstaller --noconfirm CrateTransfer.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate-transfer-${{ matrix.os }}
+          path: dist/
