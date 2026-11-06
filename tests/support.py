@@ -133,7 +133,7 @@ def make_library(directory, files, crates, assets):
         target = volume / relative.lstrip("/")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-    create_root_database(directory / "root.sqlite")
+    create_root_database(directory / "root.sqlite", keep_unrelated=False)
     create_aggregate_database(directory / "master.sqlite", volume, crates, assets)
     return volume
 

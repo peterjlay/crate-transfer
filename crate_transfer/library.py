@@ -9,7 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -300,22 +300,47 @@ class Library:
                 self.directory = nested
 
     def crates(self) -> list[dict]:
-        with closing(connect(self.directory / "master.sqlite")) as db:
-            return self._crates(db)
+        with ExitStack() as stack:
+            _, _, crates = self._read_catalog(stack)
+            return crates
 
-    def _crates(self, db: sqlite3.Connection) -> list[dict]:
+    def _read_catalog(self, stack: ExitStack):
+        master = stack.enter_context(closing(connect(self.directory / "master.sqlite")))
+        master.execute("BEGIN")
+        crates = self._crates(master)
+        root = None
+        if (self.directory / "root.sqlite").is_file():
+            root = stack.enter_context(closing(connect(self.directory / "root.sqlite")))
+            root.execute("BEGIN")
+            cached_paths = {tuple(crate["path"]) for crate in crates}
+            crates.extend(crate for crate in self._crates(root, authoritative=True)
+                          if tuple(crate["path"]) not in cached_paths)
+        return master, root, crates
+
+    def _crates(self, db: sqlite3.Connection, authoritative=False) -> list[dict]:
         required = {
             "container": {"id", "parent_id", "name", "type", "list_order"},
             "asset": {"id", "location_id", "portable_id"},
         }
-        for table, expected in required.items():
-            if not expected <= columns(db, table):
-                raise LibraryError(f"Unsupported Serato 4 aggregate schema: {table}.")
-        memberships = aggregate_memberships(db)
+        parameters = ()
+        condition = ""
+        if authoritative:
+            space, _ = check_root(db)
+            parameters = (space,)
+            condition = "WHERE c.space_id=? "
+            memberships = (
+                "SELECT ca.container_id,sa.asset_id FROM container_asset ca "
+                "JOIN space_asset sa ON sa.id=ca.space_asset_id"
+            )
+        else:
+            for table, expected in required.items():
+                if not expected <= columns(db, table):
+                    raise LibraryError(f"Unsupported Serato 4 aggregate schema: {table}.")
+            memberships = aggregate_memberships(db)
         rows = db.execute(
             "SELECT c.id,c.parent_id,c.name,c.type,c.list_order,count(ca.asset_id) AS tracks "
             f"FROM container c LEFT JOIN ({memberships}) ca ON ca.container_id=c.id "
-            "GROUP BY c.id ORDER BY c.list_order,c.id"
+            f"{condition}GROUP BY c.id ORDER BY c.list_order,c.id", parameters,
         ).fetchall()
         by_id = {row["id"]: dict(row) for row in rows}
 
@@ -329,14 +354,15 @@ class Library:
                 row = by_id.get(row["parent_id"])
             return result
 
-        return [{"id": row["id"], "path": names(row), "tracks": row["tracks"]}
+        # Negative IDs keep authoritative crates distinct from aggregate IDs.
+        return [{"id": -row["id"] if authoritative else row["id"],
+                 "path": names(row), "tracks": row["tracks"]}
                 for row in rows if row["type"] == 1]
 
     def export(self, selected: list[int], machine_id: str, name: str, progress=lambda text: None) -> tuple[dict, dict[str, Path]]:
         files, paths, output, path_cache = {}, {}, [], {}
-        with closing(connect(self.directory / "master.sqlite")) as db:
-            db.execute("BEGIN")
-            available = self._crates(db)
+        with ExitStack() as stack:
+            db, root, available = self._read_catalog(stack)
             memberships = aggregate_memberships(db)
             chosen = set(selected)
             if not chosen or not chosen <= {item["id"] for item in available}:
@@ -350,20 +376,35 @@ class Library:
                     locations[row["location_id"]] = row["database_uri"]
             for crate in crates:
                 members = []
-                rows = db.execute(
-                    f"SELECT a.id,a.location_id,a.portable_id FROM ({memberships}) ca "
-                    "JOIN asset a ON a.id=ca.asset_id WHERE ca.container_id=? "
-                    "ORDER BY ca.list_order,ca.membership_id",
-                    (crate["id"],),
-                )
+                authoritative = crate["id"] < 0
+                if authoritative:
+                    if root is None:
+                        raise LibraryError("Authoritative crate is unavailable. Refresh the crate list.")
+                    rows = root.execute(
+                        "SELECT a.id,a.portable_id FROM container_asset ca "
+                        "JOIN space_asset sa ON sa.id=ca.space_asset_id "
+                        "JOIN asset a ON a.id=sa.asset_id WHERE ca.container_id=? "
+                        "ORDER BY ca.list_order,ca.id", (-crate["id"],),
+                    )
+                else:
+                    rows = db.execute(
+                        f"SELECT a.id,a.location_id,a.portable_id FROM ({memberships}) ca "
+                        "JOIN asset a ON a.id=ca.asset_id WHERE ca.container_id=? "
+                        "ORDER BY ca.list_order,ca.membership_id",
+                        (crate["id"],),
+                    )
                 for row in rows:
-                    if row["id"] not in path_cache:
+                    asset_key = (authoritative, row["id"])
+                    if asset_key not in path_cache:
                         raw = row["portable_id"].replace("\\", "/")
                         if raw.startswith(("http:", "https:", "soundcloud:", "tidal:", "beatport:")):
                             raise LibraryError("Streaming-service tracks cannot be transferred. Choose local-file crates.")
-                        if row["location_id"] not in locations:
+                        if authoritative:
+                            volume = Path(self.directory.anchor)
+                        elif row["location_id"] not in locations:
                             raise LibraryError(f"No volume mapping for track {raw}. No transfer started.")
-                        volume = _volume_from_uri(locations[row["location_id"]])
+                        else:
+                            volume = _volume_from_uri(locations[row["location_id"]])
                         path = (volume / raw.lstrip("/")).resolve()
                         if not path.is_relative_to(volume.resolve()) or not path.is_file():
                             raise LibraryError(f"Missing or invalid track: {path}. No transfer started.")
@@ -372,8 +413,8 @@ class Library:
                         key = hashlib.sha256((digest + "\0" + path.name).encode()).hexdigest()
                         files[key] = {"id": key, "sha256": digest, "name": path.name, "size": path.stat().st_size}
                         paths[key] = path
-                        path_cache[row["id"]] = key
-                    members.append(path_cache[row["id"]])
+                        path_cache[asset_key] = key
+                    members.append(path_cache[asset_key])
                 output.append({"path": crate["path"], "tracks": members})
         return {"version": 1, "sender_id": machine_id, "sender_name": name,
                 "crates": output, "files": list(files.values())}, paths

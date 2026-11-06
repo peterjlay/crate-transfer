@@ -118,6 +118,13 @@ It does not rely on legacy `Subcrates/*.crate` exports.
 - Browses `master.sqlite` read-only, including volume mappings from
   `connection.database_uri`. A SQLite read transaction keeps the exported
   crate selection/membership consistent. The source library is never modified.
+  Crates present only in authoritative `root.sqlite` are also listed and can
+  be sent onward immediately, even when Serato has not added them to its
+  aggregate cache. Their memberships and local-volume paths are read directly
+  from the authoritative database. Matching full crate hierarchies already in
+  the aggregate are listed once, using the aggregate entry. Separate read
+  transactions protect each database's view; this is not an atomic snapshot
+  across both databases. Refresh the list if Serato changes it during selection.
   Supports the aggregate's `container_asset.location_container_id →
   location_container.container_id` membership mapping, as well as direct
   `container_id` layouts; both browsing counts and exported track order use
