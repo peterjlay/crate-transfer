@@ -62,6 +62,11 @@ The Computers page shows discovered agents as **Online** in bold green.
 **Not discovered** means offline or unavailable to Bonjour/mDNS; it does not
 prevent connecting by address. A changed certificate is shown in bold red and
 never trusted automatically. Failures and uncertain outcomes are also bold red.
+Paired addresses and ports follow current LAN discovery announcements when
+their machine ID and certificate fingerprint match the saved pairing. Updates
+are checked periodically and immediately before sending; tokens and certificate
+pins remain unchanged. No re-pairing is needed for an ordinary IP or port change.
+Without discovery, the saved address is used; update it by pairing by address.
 
 ## Defaults and configuration
 
@@ -223,6 +228,15 @@ If a transfer failed before import, no crate changes are committed and newly
 published music files are removed. A crash can leave unreferenced completed
 music files; these are not deleted automatically because they could already
 be referenced. Abandoned partial upload staging is cleaned on agent restart.
+
+If transfer history is unreadable, startup preserves the original as
+`transfers-damaged-<unique-id>.json` in the agent settings folder and creates an
+empty Activity history. A visible warning gives the backup location; settings,
+pairings, music and Serato databases are untouched. Do not resend old transfers
+until you check Serato and backups on both machines: their previous receipts
+are unavailable while that history is damaged. No transfers are retried
+automatically. If preserving the file or saving new history fails, startup
+stops and reports the error rather than discarding it.
 
 ## Test and package
 

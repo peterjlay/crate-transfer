@@ -222,6 +222,10 @@ class Window(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(1000)
+        if self.agent.startup_warning:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "Transfer history recovered", self.agent.startup_warning,
+            ))
         if start_services:
             QTimer.singleShot(0, self.load_crates)
 
@@ -545,6 +549,7 @@ class Window(QMainWindow):
                 item.setExpanded(True)
 
     def send(self):
+        self.refresh_computers()
         selected, peer_id = self.selected_crates(), self.target.currentData()
         if not selected or peer_id is None or self.sending:
             return
@@ -584,7 +589,8 @@ class Window(QMainWindow):
         self.pairing_status.setText(f"PIN {self.agent.pair_code} / {remaining}s" if remaining else "Pairing is closed")
         status_style(self.pairing_status, "success" if remaining else "neutral")
         own = self.settings.snapshot()
-        state = (own["peers"], own["trusted"])
+        state = (own["peers"], own["trusted"],
+                 self.discovery.snapshot() if self.discovery else [])
         if state != getattr(self, "last_pairing_state", None):
             self.last_pairing_state = state
             self.refresh_computers()

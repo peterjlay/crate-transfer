@@ -42,6 +42,73 @@ class AgentTests(unittest.TestCase):
         record = file_record("track.mp3", content)
         return valid_manifest([record]), record, content
 
+    def test_damaged_history_is_preserved_and_startup_recovers_without_touching_user_data(self):
+        for index, damaged in enumerate((
+            b"[invalid", b"", b"\xff", b"{}", b"[null]",
+            b'[{"id":42,"status":"complete","created":1}]',
+        )):
+            with self.subTest(case=index):
+                agent, settings, library, music = self.make_receiver(prefix=f"damaged-{index}")
+                before_settings = settings.path.read_bytes()
+                before_root = root_snapshot(library / "root.sqlite")
+                before_identity = agent.fingerprint
+                history = settings.directory / "transfers.json"
+                history.write_bytes(damaged)
+                staging = music / ".crate-transfer-incoming" / ("a" * 32)
+                staging.mkdir(parents=True)
+                (staging / "keep").write_bytes(b"partial-media")
+                with self.assertLogs("crate_transfer.agent", level="WARNING"):
+                    recovered = Agent(settings, guard=lambda: None)
+                backups = list(settings.directory.glob("transfers-damaged-*.json"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), damaged)
+                self.assertIn(str(backups[0]), recovered.startup_warning)
+                self.assertIn("before resending", recovered.startup_warning)
+                self.assertEqual(recovered.history(), [])
+                self.assertEqual(json.loads(history.read_text()), [])
+                self.assertEqual(settings.path.read_bytes(), before_settings)
+                self.assertEqual(recovered.fingerprint, before_identity)
+                self.assertEqual(root_snapshot(library / "root.sqlite"), before_root)
+                self.assertEqual((staging / "keep").read_bytes(), b"partial-media")
+                restarted = Agent(settings, guard=lambda: None)
+                self.assertIsNone(restarted.startup_warning)
+                self.assertEqual(restarted.history(), [])
+                self.assertEqual(backups[0].read_bytes(), damaged)
+
+    def test_valid_bom_history_preserves_receipts_without_recovery(self):
+        agent, settings, _, _ = self.make_receiver()
+        job = {"id": "a" * 32, "created": 1, "status": "complete",
+               "owner": PEER_ID, "result": {"crates": 1}}
+        agent.jobs_path.write_bytes(b"\xef\xbb\xbf" + json.dumps([job]).encode())
+        recovered = Agent(settings, guard=lambda: None)
+        self.assertEqual(recovered.history(), [job])
+        self.assertIsNone(recovered.startup_warning)
+        self.assertEqual(list(settings.directory.glob("transfers-damaged-*.json")), [])
+
+    def test_history_read_or_preservation_failure_stops_startup_without_overwriting(self):
+        agent, settings, _, _ = self.make_receiver()
+        damaged = b"[invalid"
+        agent.jobs_path.write_bytes(damaged)
+        for operation in ("open", "rename"):
+            with self.subTest(operation=operation):
+                with patch.object(Path, operation, side_effect=PermissionError("access denied")):
+                    with self.assertRaises(PermissionError):
+                        Agent(settings, guard=lambda: None)
+                self.assertEqual(agent.jobs_path.read_bytes(), damaged)
+                self.assertEqual(list(settings.directory.glob("transfers-damaged-*.json")), [])
+
+    def test_history_save_failure_after_recovery_preserves_original_backup(self):
+        agent, settings, _, _ = self.make_receiver()
+        damaged = b"[invalid"
+        agent.jobs_path.write_bytes(damaged)
+        with patch("crate_transfer.agent.atomic_json", side_effect=OSError("disk full")), \
+                self.assertLogs("crate_transfer.agent", level="WARNING"):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                Agent(settings, guard=lambda: None)
+        backups = list(settings.directory.glob("transfers-damaged-*.json"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), damaged)
+
     def test_windows_reserved_port_error_reports_action_without_changing_port(self):
         agent, settings, _, _ = self.make_receiver()
         denied = OSError("Socket access denied")

@@ -41,10 +41,37 @@ class Agent:
         self.pair_code, self.pair_until, self.pair_attempts = "", 0.0, 0
         self.jobs_path = settings.directory / "transfers.json"
         self.jobs = []
+        self.startup_warning = None
         if self.jobs_path.exists():
-            with self.jobs_path.open(encoding="utf-8") as source:
-                self.jobs = json.load(source)
+            try:
+                with self.jobs_path.open(encoding="utf-8-sig") as source:
+                    jobs = json.load(source)
+                if not isinstance(jobs, list) or any(
+                    not isinstance(job, dict)
+                    or not isinstance(job.get("id"), str)
+                    or not isinstance(job.get("status"), str)
+                    or ("created" in job and not isinstance(job["created"], (int, float)))
+                    for job in jobs
+                ):
+                    raise ValueError("Transfer history must be a list of jobs with an id, status and timestamp.")
+            except ValueError as error:
+                backup = self.jobs_path.with_name(f"transfers-damaged-{uuid.uuid4().hex}.json")
+                # Preserve the original before allowing atomic_json to replace it.
+                # Filesystem failures must still stop startup, not discard history.
+                self.jobs_path.rename(backup)
+                self.startup_warning = (
+                    f"The transfer history could not be read: {error}\n\n"
+                    f"The original file was preserved at:\n{backup}\n\n"
+                    "Activity has been reset. Pairings, settings, music and Serato databases "
+                    "were not changed. Check Serato and backups on both computers before "
+                    "resending any previous transfer, especially an uncertain one. "
+                    "Previous transfer receipts are unavailable until the history is repaired."
+                )
+                LOG.warning("%s", self.startup_warning, exc_info=True)
+            else:
+                self.jobs = jobs
             for job in self.jobs:
+                job.setdefault("created", self.jobs_path.stat().st_mtime)
                 if job["status"] not in ("complete", "failed", "uncertain"):
                     was_importing = job["status"] == "importing"
                     job.update(status="uncertain" if was_importing else "failed",
