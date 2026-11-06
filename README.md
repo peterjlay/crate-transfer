@@ -62,6 +62,11 @@ The Computers page shows discovered agents as **Online** in bold green.
 **Not discovered** means offline or unavailable to Bonjour/mDNS; it does not
 prevent connecting by address. A changed certificate is shown in bold red and
 never trusted automatically. Failures and uncertain outcomes are also bold red.
+Paired addresses and ports follow current LAN discovery announcements when
+their machine ID and certificate fingerprint match the saved pairing. Updates
+are checked periodically and immediately before sending; tokens and certificate
+pins remain unchanged. No re-pairing is needed for an ordinary IP or port change.
+Without discovery, the saved address is used; update it by pairing by address.
 
 ## Defaults and configuration
 
@@ -78,6 +83,14 @@ for example to OneDrive.
 Each folder field has a **Copy** button that copies its complete path, even
 when the field is scrolled or only part of its text is selected. Standard
 text selection, Copy/Paste context menus, and keyboard shortcuts also work.
+
+On Windows, socket error **10013** means Windows denied the agent's listening
+port; a reserved range, another service, or security policy can cause this.
+Check reservations with `netsh interface ipv4 show excludedportrange protocol=tcp`.
+Choose an available **Agent TCP port** in Settings (for example 48783), click
+**Save connection port**, and restart. This saves the port independently of
+library-folder validation. Bonjour advertises the chosen port; manual pairing must use it.
+Do not disable the firewall or run as administrator as a workaround.
 
 Source absolute paths are **not sent to or reused on the destination computer**.
 A received file is stored as:
@@ -123,6 +136,14 @@ It does not rely on legacy `Subcrates/*.crate` exports.
 - Makes SQLite Backup API snapshots of **both** databases, verifies backup
   integrity, uses a single `BEGIN IMMEDIATE` transaction, and checks foreign
   keys and SQLite integrity before committing.
+  Some aggregate caches use Serato-only collations such as
+  `serato_asset_string_comparator`. If those prevent the aggregate backup's
+  integrity check, its complete schema and every table row are compared with
+  the same source read snapshot instead. The Backup API preserves its indexes;
+  their Serato-specific ordering cannot be independently checked. The original
+  aggregate is never changed. No substitute comparator is registered, and the
+  authoritative `root.sqlite` must still pass all integrity checks; unsupported
+  collations there stop the import before any library changes.
 - Verifies every music file's size and SHA-256 before importing. Transfers
   stream files in bounded chunks rather than loading music into memory.
 - Never replaces an existing crate or differing music file. Reused music is
@@ -208,6 +229,15 @@ published music files are removed. A crash can leave unreferenced completed
 music files; these are not deleted automatically because they could already
 be referenced. Abandoned partial upload staging is cleaned on agent restart.
 
+If transfer history is unreadable, startup preserves the original as
+`transfers-damaged-<unique-id>.json` in the agent settings folder and creates an
+empty Activity history. A visible warning gives the backup location; settings,
+pairings, music and Serato databases are untouched. Do not resend old transfers
+until you check Serato and backups on both machines: their previous receipts
+are unavailable while that history is damaged. No transfers are retried
+automatically. If preserving the file or saving new history fails, startup
+stops and reports the error rather than discarding it.
+
 ## Test and package
 
 ```sh
@@ -222,9 +252,10 @@ synthetic Serato-shaped databases and synthetic media, **not your library**.
 For an isolated development agent use `--data-dir <absolute-folder>`.
 
 - macOS output: `dist/Crate Transfer.app`. Copy it to Applications.
-  CI downloads are `Crate-Transfer-macOS-arm64.dmg` (Apple Silicon) and
-  `Crate-Transfer-macOS-x86_64.dmg` (Intel). Open the DMG and drag the app
-  onto its Applications link. The bundle declares macOS 12+; CI tests macOS 15,
+  CI downloads are `Crate-Transfer-macOS-arm64.zip` (Apple Silicon) and
+  `Crate-Transfer-macOS-x86_64.zip` (Intel). Extract using Archive Utility
+  and drag the app into Applications. ZIP creation uses macOS `ditto` to
+  preserve bundle symlinks and metadata. The bundle declares macOS 12+; CI tests macOS 15,
   not the minimum OS version.
 - Windows output: `dist/Crate Transfer/Crate Transfer.exe`. Distribute the
   **whole folder**, not the executable alone. CI produces
@@ -234,6 +265,26 @@ For an isolated development agent use `--data-dir <absolute-folder>`.
   the appropriate signing certificates/notarization. CI packages are also
   not Developer ID signed or notarized; Windows packages are not Authenticode
   signed.
+
+### macOS Gatekeeper
+
+The current macOS packages are ad-hoc signed, not Apple-notarized. Passing
+`codesign --verify` verifies the bundle's signature integrity; it does not
+establish Gatekeeper trust. On Sequoia, rejection or a pre-launch bounce can
+persist even after **Open Anyway**. ZIP delivery has been restored to avoid
+the reported DMG-specific launch problem, but changing archive formats does
+not add Apple trust or guarantee Gatekeeper approval.
+
+Trusted distribution requires an Apple Developer membership, a **Developer ID
+Application** certificate, hardened-runtime signing of the app and its nested
+code, Apple notarization, and stapling/verification of the app before archiving.
+These credentials are not currently available, so the existing packages cannot
+be claimed to pass Gatekeeper. Do not disable Gatekeeper or remove quarantine
+as a workaround. Until signed/notarized packages are available, use the
+**Run from source** instructions above rather than the downloaded application.
+
+### Runner builds and releases
+
 - `.github/workflows/build.yml` runs for branch pushes, pull requests, `v*`
   tags and manual **Run workflow** requests. Explicit hosted runners are
   `macos-15` (native Apple Silicon), `macos-15-intel` (native Intel, not
@@ -241,8 +292,9 @@ For an isolated development agent use `--data-dir <absolute-folder>`.
   Each job checks runner/Python architecture, runs all tests, builds with
   PyInstaller, and checks the packaged executable architecture. It renders
   the packaged UI with a timeout and requires a screenshot, running from the
-  mounted, verified DMG or the extracted Windows ZIP. Download the matching
-  Actions artifact to obtain its DMG/ZIP.
+  extracted ZIP. macOS jobs also verify archive integrity and the extracted
+  bundle's signature integrity (not Gatekeeper approval). Download the matching
+  Actions artifact to obtain its ZIP.
 - Successful `v*` tag pushes and manual runs against `v*` tags automatically
   publish all three packages to that tag's GitHub Release, only after every
   build/test/smoke check passes. Branch and PR runs never publish. Only the
@@ -265,20 +317,17 @@ For an isolated development agent use `--data-dir <absolute-folder>`.
   Rerunning the same tag replaces its package assets, so downloaded binaries
   may differ as build dependencies evolve. Immutable releases may reject asset
   replacement; publish a new version instead.
-- To create a local DMG after a native macOS build:
+- To create a local ZIP after a native macOS build:
 
   ```sh
-  mkdir -p packaging/dmg
-  ditto "dist/Crate Transfer.app" "packaging/dmg/Crate Transfer.app"
-  ln -s /Applications packaging/dmg/Applications
-  hdiutil create -volname "Crate Transfer" -srcfolder packaging/dmg \
-    -format UDZO "dist/Crate-Transfer-macOS-$(uname -m).dmg"
-  hdiutil verify "dist/Crate-Transfer-macOS-$(uname -m).dmg"
+  ditto -c -k --sequesterRsrc --keepParent "dist/Crate Transfer.app" \
+    "dist/Crate-Transfer-macOS-$(uname -m).zip"
+  unzip -t "dist/Crate-Transfer-macOS-$(uname -m).zip"
   ```
 
-  Use a fresh `packaging/dmg` staging folder for each build. For an isolated
-  Intel Python environment, pass `--distpath dist/intel --workpath build/intel`
-  to PyInstaller and stage `dist/intel/Crate Transfer.app` instead. A Rosetta
+  For an isolated Intel Python environment, pass
+  `--distpath dist/intel --workpath build/intel`
+  to PyInstaller and archive `dist/intel/Crate Transfer.app` instead. A Rosetta
   local build is not a substitute for the native Intel CI job.
 
 ## Format references

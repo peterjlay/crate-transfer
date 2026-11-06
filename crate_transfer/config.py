@@ -47,7 +47,7 @@ class Settings:
             "trusted": {},
         }
         if self.path.exists():
-            with self.path.open(encoding="utf-8") as source:
+            with self.path.open(encoding="utf-8-sig") as source:
                 self.value.update(json.load(source))
         self.save()
 

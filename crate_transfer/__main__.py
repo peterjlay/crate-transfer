@@ -27,6 +27,11 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
     try:
+        if sys.platform == "win32":
+            import ctypes
+            result = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("app.cratetransfer.desktop")
+            if result != 0:
+                raise OSError(f"Could not set Windows application identity (HRESULT {result:#x}).")
         directory = args.data_dir or data_directory()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = QLockFile(str(directory / "agent.lock"))

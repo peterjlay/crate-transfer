@@ -137,6 +137,54 @@ def columns(db: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in db.execute(f'PRAGMA table_info("{table}")')}
 
 
+def verify_backup_contents(source: sqlite3.Connection, target: sqlite3.Connection):
+    schema_query = "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name"
+    schema = [tuple(row) for row in source.execute(schema_query)]
+    if schema != [tuple(row) for row in target.execute(schema_query)]:
+        raise LibraryError("Database backup schema differs from its source. Import stopped.")
+    for kind, name, _, _, _ in schema:
+        if kind != "table":
+            continue
+        quoted = '"' + name.replace('"', '""') + '"'
+        # Backup API preserves table B-trees and scan order. Do not consult
+        # aggregate sort indexes whose collations only Serato implements.
+        with closing(source.execute(f"SELECT * FROM {quoted} NOT INDEXED")) as original, \
+                closing(target.execute(f"SELECT * FROM {quoted} NOT INDEXED")) as copied:
+            while True:
+                expected = [tuple(row) for row in original.fetchmany(128)]
+                actual = [tuple(row) for row in copied.fetchmany(128)]
+                if expected != actual:
+                    raise LibraryError("Database backup contents differ from its source. Import stopped.")
+                if not expected:
+                    break
+
+
+def backup_database(source: sqlite3.Connection, target: sqlite3.Connection, filename: str):
+    source.execute("BEGIN")
+    # Pin a source read snapshot for both the Backup API and any comparison.
+    source.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    source.backup(target)
+    try:
+        results = target.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.OperationalError as error:
+        missing_collation = str(error).startswith("no such collation sequence: ")
+        if filename != "master.sqlite" or not missing_collation:
+            raise LibraryError(
+                f"Cannot validate {filename} backup: {error}. Import stopped; "
+                "no library changes were made. The authoritative root.sqlite "
+                "must pass SQLite integrity checks without substitute Serato collations."
+            ) from error
+        verify_backup_contents(source, target)
+        LOG.warning(
+            "Verified master.sqlite backup schema and every table row against its source snapshot. "
+            "Serato-only index ordering cannot be checked (%s); the aggregate is not modified.",
+            error,
+        )
+    else:
+        if [row[0] for row in results] != ["ok"]:
+            raise LibraryError(f"{filename} backup failed its integrity check. Import stopped.")
+
+
 def aggregate_memberships(db: sqlite3.Connection) -> str:
     fields = columns(db, "container_asset")
     required = {"asset_id", "list_order"}
@@ -355,9 +403,7 @@ class Library:
         backup_dir.mkdir(parents=True, exist_ok=False)
         for filename in ("root.sqlite", "master.sqlite"):
             with closing(connect(self.directory / filename)) as source, closing(sqlite3.connect(backup_dir / filename)) as target:
-                source.backup(target)
-                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise LibraryError("Database backup failed its integrity check. Import stopped.")
+                backup_database(source, target, filename)
 
         with closing(connect(root_path, writable=True)) as db:
             try:

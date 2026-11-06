@@ -222,6 +222,10 @@ class Window(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(1000)
+        if self.agent.startup_warning:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "Transfer history recovered", self.agent.startup_warning,
+            ))
         if start_services:
             QTimer.singleShot(0, self.load_crates)
 
@@ -422,6 +426,7 @@ class Window(QMainWindow):
         self.port_input.setRange(1024, 65535)
         self.port_input.setValue(self.settings.snapshot()["port"])
         form.addRow("Agent TCP port", self.port_input)
+        form.addRow("", button("Save connection port", self.save_connection_port))
         self.startup_input = QCheckBox("Launch at login (quietly in the menu bar / system tray)")
         try:
             self.startup_input.setChecked(startup.enabled())
@@ -544,6 +549,7 @@ class Window(QMainWindow):
                 item.setExpanded(True)
 
     def send(self):
+        self.refresh_computers()
         selected, peer_id = self.selected_crates(), self.target.currentData()
         if not selected or peer_id is None or self.sending:
             return
@@ -583,7 +589,8 @@ class Window(QMainWindow):
         self.pairing_status.setText(f"PIN {self.agent.pair_code} / {remaining}s" if remaining else "Pairing is closed")
         status_style(self.pairing_status, "success" if remaining else "neutral")
         own = self.settings.snapshot()
-        state = (own["peers"], own["trusted"])
+        state = (own["peers"], own["trusted"],
+                 self.discovery.snapshot() if self.discovery else [])
         if state != getattr(self, "last_pairing_state", None):
             self.last_pairing_state = state
             self.refresh_computers()
@@ -723,6 +730,21 @@ class Window(QMainWindow):
             return
         session_id, peer = session["id"], session["peer"]
         self.run_task(lambda: self.agent.cancel(session_id, peer))
+
+    def save_connection_port(self):
+        if self.sending or self.agent.session:
+            self.show_error("Transfer in progress", "Finish or cancel transfers before changing the connection port.")
+            return
+        try:
+            self.settings.update(port=self.port_input.value())
+        except OSError as error:
+            self.show_error("Connection port was not saved", str(error))
+            return
+        QMessageBox.information(
+            self, "Connection port saved",
+            f"TCP port {self.port_input.value()} saved. Quit the agent from its tray menu and reopen it to apply. "
+            "Library folders and startup settings were not changed.",
+        )
 
     def save_settings(self):
         if self.active_tasks or self.agent.session:

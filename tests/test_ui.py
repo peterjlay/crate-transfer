@@ -62,6 +62,23 @@ class DesktopTests(unittest.TestCase):
         self.window.show()
         QTest.qWait(30)
 
+    def test_damaged_history_shows_visible_recovery_warning_after_window_initialization(self):
+        self.window.quit()
+        self.window.deleteLater()
+        self.app.processEvents()
+        path = self.settings.directory / "transfers.json"
+        path.write_bytes(b"[invalid")
+        with patch("crate_transfer.ui.QMessageBox.warning") as warning, \
+                self.assertLogs("crate_transfer.agent", level="WARNING"):
+            self.window = Window(self.settings, start_services=False)
+            self.app.processEvents()
+        warning.assert_called_once_with(
+            self.window, "Transfer history recovered", self.window.agent.startup_warning,
+        )
+        self.assertIn("transfers-damaged-", warning.call_args.args[2])
+        self.assertIn("before resending", warning.call_args.args[2])
+        self.assertEqual(self.window.activities.topLevelItemCount(), 0)
+
     def test_save_button_is_opaque_and_readable_without_hover(self):
         self.show_settings()
         QTest.mouseMove(self.window.navigation[0])
@@ -222,6 +239,17 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("separate", self.errors[-1][1])
         self.assertEqual(self.settings.snapshot()["music"], str(destination.resolve()))
 
+    def test_connection_port_saves_without_validating_library_or_changing_other_settings(self):
+        before = self.settings.snapshot()
+        self.window.library_input.setText(str(self.base / "missing"))
+        self.window.music_input.setText("")
+        self.window.port_input.setValue(48783)
+        with patch("crate_transfer.ui.QMessageBox.information") as information:
+            self.window.save_connection_port()
+        self.assertEqual(self.errors, [])
+        self.assertEqual(Settings(self.settings.directory).snapshot(), dict(before, port=48783))
+        information.assert_called_once()
+
     def test_settings_accept_serato_parent_and_persist_resolved_library_folder(self):
         parent = self.base / "Application Support" / "Serato"
         library = parent / "Library"
@@ -295,6 +323,41 @@ class DesktopTests(unittest.TestCase):
             item = self.window.computers.topLevelItem(0)
             self.assertEqual(item.text(3), "Identity changed - pair again")
             self.assertEqual(item.foreground(3).color(), QColor("#ff737d"))
+        finally:
+            self.window.discovery = None
+
+    def test_pairing_endpoint_follows_discovery_on_tick_and_before_send_without_changing_trust(self):
+        from types import SimpleNamespace
+        peer_id = "22222222-2222-4222-8222-222222222222"
+        peer = {"id": peer_id, "name": "Windows", "host": "192.168.1.20",
+                "port": 49783, "fingerprint": "a" * 64, "token": "b" * 64}
+        self.settings.update(peers={peer_id: peer})
+        discovered = {**peer, "host": "192.168.1.30", "port": 48783}
+        self.window.discovery = SimpleNamespace(snapshot=lambda: [dict(discovered)])
+        try:
+            self.window.tick()
+            expected = {**peer, "host": "192.168.1.30", "port": 48783}
+            self.assertEqual(self.settings.snapshot()["peers"][peer_id], expected)
+            discovered.update(host="192.168.1.40", port=48784)
+            self.window.tick()
+            expected.update(host="192.168.1.40", port=48784)
+            self.assertEqual(self.settings.snapshot()["peers"][peer_id], expected)
+            self.window.target.setCurrentIndex(self.window.target.findData(peer_id))
+            discovered.update(port=48785)
+            with patch.object(self.window, "selected_crates", return_value=[10]), \
+                    patch("crate_transfer.ui.QMessageBox.question",
+                          return_value=QMessageBox.StandardButton.Yes), \
+                    patch("crate_transfer.ui.send_crates") as send:
+                self.window.send()
+                self.wait_for_tasks()
+            send.assert_called_once()
+            expected["port"] = 48785
+            self.assertEqual(Settings(self.settings.directory).snapshot()["peers"][peer_id], expected)
+            discovered.update(port=49999, fingerprint="c" * 64)
+            self.window.tick()
+            self.assertEqual(self.settings.snapshot()["peers"][peer_id], expected)
+            self.assertEqual(self.window.computers.topLevelItem(0).text(3),
+                             "Identity changed - pair again")
         finally:
             self.window.discovery = None
 

@@ -41,10 +41,37 @@ class Agent:
         self.pair_code, self.pair_until, self.pair_attempts = "", 0.0, 0
         self.jobs_path = settings.directory / "transfers.json"
         self.jobs = []
+        self.startup_warning = None
         if self.jobs_path.exists():
-            with self.jobs_path.open(encoding="utf-8") as source:
-                self.jobs = json.load(source)
+            try:
+                with self.jobs_path.open(encoding="utf-8-sig") as source:
+                    jobs = json.load(source)
+                if not isinstance(jobs, list) or any(
+                    not isinstance(job, dict)
+                    or not isinstance(job.get("id"), str)
+                    or not isinstance(job.get("status"), str)
+                    or ("created" in job and not isinstance(job["created"], (int, float)))
+                    for job in jobs
+                ):
+                    raise ValueError("Transfer history must be a list of jobs with an id, status and timestamp.")
+            except ValueError as error:
+                backup = self.jobs_path.with_name(f"transfers-damaged-{uuid.uuid4().hex}.json")
+                # Preserve the original before allowing atomic_json to replace it.
+                # Filesystem failures must still stop startup, not discard history.
+                self.jobs_path.rename(backup)
+                self.startup_warning = (
+                    f"The transfer history could not be read: {error}\n\n"
+                    f"The original file was preserved at:\n{backup}\n\n"
+                    "Activity has been reset. Pairings, settings, music and Serato databases "
+                    "were not changed. Check Serato and backups on both computers before "
+                    "resending any previous transfer, especially an uncertain one. "
+                    "Previous transfer receipts are unavailable until the history is repaired."
+                )
+                LOG.warning("%s", self.startup_warning, exc_info=True)
+            else:
+                self.jobs = jobs
             for job in self.jobs:
+                job.setdefault("created", self.jobs_path.stat().st_mtime)
                 if job["status"] not in ("complete", "failed", "uncertain"):
                     was_importing = job["status"] == "importing"
                     job.update(status="uncertain" if was_importing else "failed",
@@ -291,7 +318,20 @@ class Agent:
             self.session = None
 
     def start(self, host="0.0.0.0", port=None):
-        self.server = Server((host, self.settings.snapshot()["port"] if port is None else port), Handler)
+        port = self.settings.snapshot()["port"] if port is None else port
+        try:
+            self.server = Server((host, port), Handler)
+        except OSError as error:
+            LOG.exception("Could not listen on %s:%s", host, port)
+            if getattr(error, "winerror", None) == 10013:
+                raise OSError(
+                    f"Windows denied access to TCP port {port} (WinError 10013). "
+                    "The port may be reserved by Windows, held by another service, or blocked by security policy. "
+                    "In Settings, choose another Agent TCP port (for example 48783), save, then restart the app. "
+                    "Check reserved ports with: netsh interface ipv4 show excludedportrange protocol=tcp. "
+                    "Do not disable your firewall or run as administrator to bypass this."
+                ) from error
+            raise
         self.server.agent = self
         self.server.context = self.context
         threading.Thread(target=self.server.serve_forever, name="crate-receiver", daemon=True).start()
