@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QPushButton, QSc
 
 from crate_transfer.config import Settings
 from crate_transfer.ui import PairDialog, STYLE, Window
-from support import make_library
+from support import file_record, make_library, valid_manifest
 
 
 class DesktopTests(unittest.TestCase):
@@ -91,6 +91,27 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue(button.isVisible())
         self.assertTrue(button.isEnabled())
         self.assertEqual(button.text(), "Save settings")
+
+    def test_received_crate_is_selectable_in_send_view_without_aggregate_rebuild(self):
+        from crate_transfer.library import Library
+        track = self.base / "received.mp3"
+        track.write_bytes(b"received audio")
+        record = file_record(track.name, track.read_bytes())
+        manifest = valid_manifest([record], [
+            {"path": ["West Coast Hip Hop 04"], "tracks": [record["id"]]},
+        ])
+        Library(self.settings.snapshot()["library"]).import_crates(
+            manifest, {record["id"]: track}, self.base / "received-backup", "received",
+            guard=lambda: None,
+        )
+        self.load()
+        item = next(i for i in self.window.all_items() if i.text(0) == "West Coast Hip Hop 04")
+        self.assertEqual(item.text(1), "1")
+        item.setCheckState(0, Qt.CheckState.Checked)
+        selected = self.window.selected_crates()
+        self.assertEqual(selected, [item.data(0, Qt.ItemDataRole.UserRole)])
+        self.assertLess(selected[0], 0)
+        self.assertEqual(self.window.selection_status.text(), "1 selected / includes subcrates")
 
     def test_settings_scroll_at_minimum_window_size_without_clipping_controls(self):
         self.window.resize(980, 650)

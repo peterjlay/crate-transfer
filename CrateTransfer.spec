@@ -43,7 +43,7 @@ if sys.platform == "darwin":
         collection,
         name="Crate Transfer.app",
         bundle_identifier="app.cratetransfer.desktop",
-        version="0.1.0",
+        version="0.1.2",
         icon="assets/CrateTransfer.icns",
         info_plist={
             "NSHighResolutionCapable": True,

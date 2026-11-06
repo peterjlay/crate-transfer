@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serato-crate-transfer"
-version = "0.1.0"
+version = "0.1.2"
 description = "Manual, paired LAN transfers for Serato DJ 4 crates and music."
 requires-python = ">=3.9"
 dependencies = [

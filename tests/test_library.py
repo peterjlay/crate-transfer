@@ -419,6 +419,77 @@ class LibraryTests(unittest.TestCase):
         }
         return manifest, installed, records, (first, second)
 
+    def test_received_root_only_crates_are_listed_and_exported_before_aggregation(self):
+        library, library_dir, music = self.make_receiver()
+        manifest, installed, records, contents = self.make_import(music)
+        library.import_crates(manifest, installed, self.base / "forward-backup", "forward",
+                              guard=lambda: None)
+        root_bytes = (library_dir / "root.sqlite").read_bytes()
+        master_bytes = (library_dir / "master.sqlite").read_bytes()
+        crates = library.crates()
+        incoming = next(crate for crate in crates if crate["path"] == ["Incoming"])
+        child = next(crate for crate in crates if crate["path"] == ["Incoming", "Child"])
+        self.assertLess(incoming["id"], 0)
+        self.assertNotEqual(incoming["id"], child["id"])
+        self.assertEqual((incoming["tracks"], child["tracks"]), (2, 2))
+        # A fresh adapter reproduces restart behaviour without a persistent cache.
+        exported, paths = Library(library_dir).export(
+            [incoming["id"], child["id"]], "11111111-1111-4111-8111-111111111111", "Forwarder",
+        )
+        self.assertEqual({tuple(c["path"]): c["tracks"] for c in exported["crates"]},
+                         {tuple(c["path"]): c["tracks"] for c in manifest["crates"]})
+        self.assertEqual(len(exported["files"]), 2)
+        for record, content in zip(records, contents):
+            self.assertEqual(paths[record["id"]].read_bytes(), content)
+            self.assertEqual(paths[record["id"]], installed[record["id"]].resolve())
+        self.assertEqual((library_dir / "root.sqlite").read_bytes(), root_bytes)
+        self.assertEqual((library_dir / "master.sqlite").read_bytes(), master_bytes)
+        installed[records[0]["id"]].unlink()
+        with self.assertRaisesRegex(LibraryError, "Missing or invalid track"):
+            library.export([incoming["id"]], "11111111-1111-4111-8111-111111111111", "Forwarder")
+
+    def test_root_and_aggregate_asset_ids_do_not_collide_and_paths_are_not_duplicated(self):
+        library, _, _, _ = self.make_source()
+        root = library.directory / "root.sqlite"
+        local = self.base / "local.mp3"
+        local.write_bytes(b"root-track")
+        with closing(sqlite3.connect(root)) as db:
+            db.execute("INSERT INTO asset VALUES (1,1,?,'local.mp3',10,'audio','mp3','local',1,1)",
+                       (portable_path(str(local.resolve()), sys.platform == "win32"),))
+            db.execute("INSERT INTO space_asset VALUES (1,1,1)")
+            db.execute("INSERT INTO container VALUES (10,1,1,'Root only',1,1,1,1,0,'',NULL)")
+            db.execute("INSERT INTO container_asset VALUES (1,1,10,1,1,1)")
+            # Same hierarchy in both DBs must retain the aggregate ID/membership.
+            db.execute("INSERT INTO container VALUES (11,1,1,'Selected',1,2,1,1,0,'',NULL)")
+            db.execute("INSERT INTO container_asset VALUES (2,1,11,1,1,1)")
+            db.execute("INSERT INTO container VALUES (12,1,11,'Root child',1,1,1,1,0,'',NULL)")
+            db.execute("INSERT INTO container_asset VALUES (3,1,12,1,1,1)")
+            db.execute("INSERT INTO space VALUES (2,'Other space',1)")
+            db.execute("INSERT INTO container VALUES (21,1,NULL,'Other space crate',1,1,2,1,0,'',NULL)")
+            db.commit()
+        crates = library.crates()
+        self.assertNotIn(["Other space crate"], [c["path"] for c in crates])
+        self.assertEqual(len([c for c in crates if c["path"] == ["Selected"]]), 1)
+        self.assertEqual(next(c for c in crates if c["path"] == ["Selected"])["id"], 10)
+        exported, paths = library.export(
+            [10, -10], "11111111-1111-4111-8111-111111111111", "Sender",
+        )
+        self.assertEqual({tuple(c["path"]) for c in exported["crates"]},
+                         {("Selected",), ("Selected", "Child"), ("Selected", "Root child"),
+                          ("Root only",)})
+        by_name = {r["name"]: r["id"] for r in exported["files"]}
+        self.assertEqual(next(c["tracks"] for c in exported["crates"] if c["path"] == ["Root only"]),
+                         [by_name["local.mp3"]])
+        self.assertEqual(paths[by_name["local.mp3"]].read_bytes(), b"root-track")
+        self.assertNotEqual(by_name["local.mp3"], by_name["one.mp3"])
+        # Once the aggregate has caught up, the old root ID must require refresh.
+        with closing(sqlite3.connect(library.directory / "master.sqlite")) as db:
+            db.execute("INSERT INTO container VALUES (20,1,'Root only',1,20)")
+            db.commit()
+        with self.assertRaisesRegex(LibraryError, "Refresh if the library changed"):
+            library.export([-10], "11111111-1111-4111-8111-111111111111", "Sender")
+        self.assertEqual(next(c for c in library.crates() if c["path"] == ["Root only"])["id"], 20)
+
     def test_import_preserves_serato_collated_aggregate_and_its_backup_indexes(self):
         library, library_dir, music = self.make_receiver()
         manifest, installed, _, _ = self.make_import(music)
