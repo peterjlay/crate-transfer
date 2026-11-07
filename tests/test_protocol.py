@@ -6,6 +6,7 @@ from crate_transfer.protocol import (
     MAX_FILE,
     MAX_TOTAL,
     ProtocolError,
+    PROTOCOL,
     identifier,
     label,
     machine_id,
@@ -19,6 +20,49 @@ class ProtocolTests(unittest.TestCase):
         record = file_record("Track.mp3", b"ID3\x00synthetic-tag-and-audio")
         manifest = valid_manifest([record], [{"path": ["Live", "Set"], "tracks": [record["id"]]}])
         self.assertIs(validate_manifest(manifest), manifest)
+
+    def test_metadata_validates_cue_units_grid_order_and_nonfinite_values(self):
+        record = file_record("metadata.mp3", b"metadata")
+        metadata = {"title": "Song", "artist": "Artist", "bpm": 124.0, "key": "Am",
+                    "cues": [{"kind": "cue", "position": 1.25, "name": "Intro", "slot": 0},
+                             {"kind": "loop", "position": 4.0, "end": 8.0, "name": "Loop"}],
+                    "beatgrid": [{"position": 0.5, "bpm": 124.0, "beat": 1}]}
+        self.assertIsInstance(validate_manifest(valid_manifest([dict(record, metadata=metadata)])), dict)
+        invalid = [
+            {"bpm": float("nan")}, {"bpm": float("inf")}, {"bpm": 0}, {"bpm": True}, {"bpm": 10**400},
+            {"cues": [{"kind": "loop", "position": 1, "end": 1}]},
+            {"cues": [{"kind": "cue", "position": -1}]},
+            {"cues": [{"kind": "cue", "position": 1, "slot": 256}]},
+            {"cues": [{"kind": "cue", "position": 1, "name": "bad\nname"}]},
+            {"beatgrid": [{"position": 2, "bpm": 120, "beat": 1},
+                          {"position": 1, "bpm": 120, "beat": 1}]},
+            {"beatgrid": [{"position": 0, "bpm": 120, "beat": 0}]},
+            {"source_path": "/private/library/file.mp3"},
+        ]
+        for value in invalid:
+            with self.subTest(metadata=value), self.assertRaises(ProtocolError):
+                validate_manifest(valid_manifest([dict(record, metadata=value)]))
+
+    def test_all_legacy_protocol_manifests_are_rejected(self):
+        for old in (1, 2):
+            manifest = valid_manifest()
+            del manifest["protocol"]
+            manifest["version"] = old
+            with self.subTest(version=old), self.assertRaisesRegex(ProtocolError, "Update Crate Transfer"):
+                validate_manifest(manifest)
+
+    def test_portable_destination_is_explicit_and_cannot_supply_a_remote_filesystem_path(self):
+        manifest = dict(valid_manifest(), destination={"format": "m3u"})
+        self.assertIs(validate_manifest(manifest), manifest)
+        for destination in (None, {}, {"format": "onelibrary"}, {"format": "m3u", "path": "/tmp"}):
+            with self.subTest(destination=destination), self.assertRaises(ProtocolError):
+                validate_manifest(dict(manifest, destination=destination))
+        with self.assertRaises(ProtocolError):
+            validate_manifest(dict(manifest, version=1))
+        with self.assertRaises(ProtocolError):
+            validate_manifest(dict(manifest, protocol="old"))
+        for format in ("serato", "m3u", "rekordbox-xml", "traktor-nml", "djay"):
+            self.assertEqual(validate_manifest(dict(manifest, destination={"format": format}))["protocol"], PROTOCOL)
 
     def test_mpeg_video_filenames_are_accepted_case_insensitively(self):
         for extension in (".mpg", ".mpeg", ".MPG", ".MPEG"):

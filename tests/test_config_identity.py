@@ -9,6 +9,48 @@ from crate_transfer.identity import client_context, identity
 
 
 class SettingsTests(unittest.TestCase):
+    def test_native_path_and_opt_in_maps_reject_invalid_values_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Settings(Path(temporary))
+            settings.update(native_libraries={"mixxx": "/synthetic/mixxxdb.sqlite"},
+                            native_receive={"mixxx": True})
+            before = settings.snapshot()
+            for values in ({"native_libraries": []}, {"native_libraries": {"mixxx": False}},
+                           {"native_receive": {"mixxx": "true"}}, {"native_receive": {"mixxx": 1}}):
+                with self.subTest(values=values), self.assertRaisesRegex(ValueError, "must be a mapping"):
+                    settings.update(**values)
+                self.assertEqual(settings.snapshot(), before)
+                self.assertEqual(Settings(settings.directory).snapshot(), before)
+
+    def test_old_single_source_path_migrates_without_changing_destination_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            settings = Settings(directory)
+            library = settings.snapshot()["library"]
+            settings.update(source_format="traktor-nml", source_path="/synthetic/collection.nml")
+            old = settings.snapshot()
+            del old["source_paths"]
+            from crate_transfer.config import atomic_json
+            atomic_json(settings.path, old)
+            reloaded = Settings(directory).snapshot()
+            self.assertEqual(reloaded["source_paths"], {"traktor-nml": "/synthetic/collection.nml"})
+            self.assertEqual(reloaded["library"], library)
+
+    def test_new_crate_transfer_defaults_do_not_move_existing_saved_music_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            with patch("crate_transfer.config.Path.home", return_value=home):
+                settings = Settings(home / "settings")
+                self.assertEqual(settings.snapshot()["music"], str(home / "Music/Crate Transfers"))
+                self.assertEqual(settings.snapshot()["exports"], str(home / "Music/Crate Transfers/Exports"))
+                self.assertIs(settings.snapshot()["portable_receive"], False)
+                old = home / "Music/Serato Transfers"
+                old.mkdir(parents=True)
+                media = old / "keep.mp3"
+                media.write_bytes(b"referenced music")
+                settings.update(music=str(old))
+                self.assertEqual(Settings(settings.directory).snapshot()["music"], str(old))
+                self.assertEqual(media.read_bytes(), b"referenced music")
     def test_settings_accept_powershell_utf8_bom_and_preserve_pairings(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

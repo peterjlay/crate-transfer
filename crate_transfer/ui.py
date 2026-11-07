@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -16,11 +17,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .agent import Agent, check_transfer, pair_computer, send_crates
+from .agent import Agent, check_transfer, export_local, pair_computer, send_crates
 from .config import Settings
+from .compatibility import compatibility_warnings
+from .catalog import (
+    OUTPUT_NAMES, SOURCES, find_source, source_definition, source_exists, source_guidance, source_library,
+)
 from .discovery import Discovery
 from .library import Library
-from .protocol import label
+from .protocol import NATIVE_DESTINATIONS, label
+from .native import NATIVE_NAMES, destination_path, native_library
+from .portable import METADATA_WARNING
 from . import startup
 
 LOG = logging.getLogger(__name__)
@@ -73,11 +80,26 @@ def app_icon(size=64) -> QIcon:
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.scale(size / 64, size / 64)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#7de2c4"))
-    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
-    painter.setBrush(QColor("#10251e"))
-    for x, height in ((17, 15), (27, 31), (37, 23), (47, 11)):
-        painter.drawRoundedRect(x, 32 - height // 2, 5, height, 2, 2)
+    painter.setBrush(QColor("#242835"))
+    painter.drawRoundedRect(2, 2, 60, 60, 14, 14)
+    painter.setBrush(QColor("#101114"))
+    painter.drawEllipse(7, 7, 50, 50)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor("#3c3d40"), 0.45))
+    for inset in range(9, 23, 2):
+        painter.drawEllipse(inset, inset, 64 - 2 * inset, 64 - 2 * inset)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#d98a47"))
+    painter.drawEllipse(23, 23, 18, 18)
+    painter.setPen(QPen(QColor("#f2c18b"), 0.6))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(25, 25, 14, 14)
+    painter.setPen(QPen(QColor("#f2c18b"), 0.8))
+    painter.drawLine(28, 27, 36, 27)
+    painter.drawLine(29, 37, 35, 37)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#101114"))
+    painter.drawEllipse(30.5, 30.5, 3, 3)
     painter.end()
     return QIcon(pixmap)
 
@@ -226,8 +248,6 @@ class Window(QMainWindow):
             QTimer.singleShot(0, lambda: QMessageBox.warning(
                 self, "Transfer history recovered", self.agent.startup_warning,
             ))
-        if start_services:
-            QTimer.singleShot(0, self.load_crates)
 
     def run_task(self, action, callback=lambda result: None):
         self.active_tasks += 1
@@ -303,14 +323,37 @@ class Window(QMainWindow):
     def send_page(self):
         widget, layout = self.page_layout(
             "Send your next set.",
-            "Choose crates, pick a paired computer, and send. Music and crate paths travel together.",
+            "Choose a source library, select playlists, and convert locally or send to a paired computer.",
         )
         banner, content = card()
-        content.addWidget(text("SERATO DJ 4 LIBRARY", "eyebrow"))
+        content.addWidget(text("DJ LIBRARY TRANSFER & CONVERSION", "eyebrow"))
         content.addWidget(text("Original files. Local paths. Nothing overwritten.", wrap=True))
-        content.addWidget(text("Subcrates are included when you select a parent. The other computer preserves "
-                               "original crate names. Quit Serato on that computer first.", "muted", True))
+        content.addWidget(text("Selecting a parent includes subplaylists. Native integration and exchange files "
+                               "are distinct. Only validated adapters are enabled; OneLibrary export "
+                               "and unvalidated native libraries are unavailable.", "muted", True))
         layout.addWidget(banner)
+        sources = QHBoxLayout()
+        self.source_format = QComboBox()
+        for source in SOURCES:
+            self.source_format.addItem(source.name, source.key)
+            item = self.source_format.model().item(self.source_format.count() - 1)
+            item.setToolTip(source.reason or source_guidance(source.key))
+        index = self.source_format.findData(self.settings.snapshot()["source_format"])
+        if index >= 0:
+            self.source_format.setCurrentIndex(index)
+        self.active_source_format = self.source_format.currentData()
+        sources.addWidget(self.source_format)
+        settings = self.settings.snapshot()
+        path = settings["source_paths"].get(
+            self.active_source_format, settings["library"] if self.active_source_format == "serato" else "",
+        )
+        self.source_path = QLineEdit(path)
+        self.source_path.setPlaceholderText("Library folder or exported playlist file for this source")
+        sources.addWidget(self.source_path, 1)
+        sources.addWidget(button("Choose source...", self.choose_source))
+        layout.addLayout(sources)
+        self.source_hint = text(source_guidance(self.active_source_format), "muted", True)
+        layout.addWidget(self.source_hint)
         toolbar = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter crates...")
@@ -319,6 +362,23 @@ class Window(QMainWindow):
         self.refresh_button = button("Refresh library", self.load_crates)
         toolbar.addWidget(self.refresh_button)
         layout.addLayout(toolbar)
+        formats = QHBoxLayout()
+        formats.addWidget(text("Destination", "muted"))
+        self.destination_format = QComboBox()
+        for format, name in OUTPUT_NAMES.items():
+            self.destination_format.addItem(name, format)
+        for name in ("OneLibrary USB",
+                     "Dual-format USB (OneLibrary + legacy Device Library)"):
+            self.destination_format.addItem(name + " (unavailable)", None)
+            item = self.destination_format.model().item(self.destination_format.count() - 1)
+            item.setEnabled(False)
+            item.setToolTip("This destination is not implemented in Crate Transfer yet; public writers require integration and validation.")
+        self.destination_format.setCurrentIndex(self.destination_format.findData("m3u"))
+        formats.addWidget(self.destination_format, 1)
+        self.export_button = button("Convert / export locally...", self.export_portable)
+        self.export_button.setEnabled(False)
+        formats.addWidget(self.export_button)
+        layout.addLayout(formats)
         self.crate_tree = QTreeWidget()
         self.crate_tree.setHeaderLabels(["Crate", "Tracks"])
         self.crate_tree.setColumnWidth(0, 500)
@@ -326,7 +386,7 @@ class Window(QMainWindow):
         self.crate_tree.setAlternatingRowColors(True)
         self.crate_tree.itemChanged.connect(self.selection_changed)
         layout.addWidget(self.crate_tree, 1)
-        self.library_status = text("Library not loaded. Configure a Serato 4 Library folder in Settings.", "muted", True)
+        self.library_status = text("No source library opened. Choose a DJ source, then Refresh library.", "muted", True)
         layout.addWidget(self.library_status)
         footer = QHBoxLayout()
         self.selection_status = text("No crates selected", "muted")
@@ -339,6 +399,9 @@ class Window(QMainWindow):
         self.target.currentIndexChanged.connect(self.selection_changed)
         footer.addWidget(self.send_button)
         layout.addLayout(footer)
+        self.source_format.currentIndexChanged.connect(self.switch_source)
+        self.source_path.textChanged.connect(self.source_changed)
+        self.source_path.editingFinished.connect(self.save_source_path)
         return widget
 
     def computers_page(self):
@@ -418,10 +481,38 @@ class Window(QMainWindow):
         self.library_input = QLineEdit(self.settings.snapshot()["library"])
         self.library_input.setObjectName("libraryPath")
         self.library_input.setPlaceholderText("Serato folder or its Library subfolder")
-        form.addRow("Serato 4 Library folder", self.path_field(self.library_input))
+        form.addRow("Serato DJ 4+ destination Library", self.path_field(self.library_input))
         self.music_input = QLineEdit(self.settings.snapshot()["music"])
         self.music_input.setObjectName("musicPath")
         form.addRow("Received music folder", self.path_field(self.music_input))
+        form.addRow("", button("Save received music folder (all native destinations)", self.save_music_settings))
+        self.djay_library_input = QLineEdit(self.settings.snapshot()["djay_library"])
+        self.djay_library_input.setPlaceholderText("djay Media Library bundle or MediaLibrary.db")
+        form.addRow("djay Pro destination library", self.path_field(self.djay_library_input))
+        self.djay_receive_input = QCheckBox("Allow native djay imports (preview; djay must be closed)")
+        self.djay_receive_input.setChecked(self.settings.snapshot()["djay_receive"] is True)
+        form.addRow("djay native reception", self.djay_receive_input)
+        form.addRow("", button("Save djay destination settings", self.save_djay_settings))
+        self.native_library_inputs = {}
+        self.native_receive_inputs = {}
+        for format in ("serato3", "traktor", "virtualdj-native", "engine", "rekordbox-native", "mixxx"):
+            field = QLineEdit(destination_path(self.settings.snapshot(), format))
+            field.setPlaceholderText("Existing native library file or folder")
+            self.native_library_inputs[format] = field
+            form.addRow(f"{NATIVE_NAMES[format]} destination", self.path_field(field))
+            enabled = QCheckBox(f"Allow {NATIVE_NAMES[format]} native imports (preview; close DJ app)")
+            enabled.setChecked(self.settings.snapshot()["native_receive"].get(format) is True)
+            self.native_receive_inputs[format] = enabled
+            form.addRow("Native reception", enabled)
+            form.addRow("", button(f"Save {NATIVE_NAMES[format]} destination",
+                                   lambda checked=False, key=format: self.save_native_settings(key)))
+        self.exports_input = QLineEdit(self.settings.snapshot()["exports"])
+        self.exports_input.setObjectName("exportsPath")
+        form.addRow("Portable export folder", self.path_field(self.exports_input))
+        self.portable_receive_input = QCheckBox("Allow paired computers to create M3U / XML / NML exports here")
+        self.portable_receive_input.setChecked(self.settings.snapshot()["portable_receive"] is True)
+        form.addRow("Portable reception", self.portable_receive_input)
+        form.addRow("", button("Save portable export settings", self.save_portable_settings))
         self.port_input = QSpinBox()
         self.port_input.setRange(1024, 65535)
         self.port_input.setValue(self.settings.snapshot()["port"])
@@ -434,9 +525,12 @@ class Window(QMainWindow):
             LOG.exception("Could not read login startup setting")
             QTimer.singleShot(0, lambda message=str(error): self.show_error("Could not read startup setting", message))
         form.addRow("Startup", self.startup_input)
+        form.addRow("", button("Save agent preferences (no DJ library required)", self.save_agent_preferences))
         content.addLayout(form)
-        content.addWidget(text("Choose the Serato folder or its Library subfolder, which contains root.sqlite and master.sqlite. Defaults are detected for macOS "
-                               "and Windows. Received music must be on the same local volume as this Library.", "muted", True))
+        content.addWidget(text("Configure an existing library for each native destination you use, enable its reception switch and "
+                               "quit that DJ app before importing. Source paths are independent. The received-music folder is shared "
+                               "by native destinations. Serato's root.sqlite/master.sqlite Library requires music on the same local volume.",
+                               "muted", True))
         content.addWidget(text("Files use readable crate folders. Shared tracks are reused "
                                "only after checksum verification. Existing music and crates are never replaced.", "muted", True))
         self.save_button = button("Save settings", self.save_settings, True)
@@ -480,16 +574,124 @@ class Window(QMainWindow):
         layout.addWidget(button("Browse...", choose))
         return widget
 
+    def current_source(self):
+        return self.source_format.currentData(), self.source_path.text().strip()
+
+    def save_source_path(self):
+        try:
+            format, path = self.current_source()
+            paths = self.settings.snapshot()["source_paths"]
+            paths[format] = path
+            self.settings.update(source_format=format, source_path=path, source_paths=paths)
+        except OSError as error:
+            LOG.exception("Could not save source library configuration")
+            self.show_error("Source settings could not be saved", str(error))
+
+    def switch_source(self, *args):
+        paths = self.settings.snapshot()["source_paths"]
+        paths[self.active_source_format] = self.source_path.text().strip()
+        format = self.source_format.currentData()
+        configured = paths.get(format)
+        discovery_error = None
+        if configured is None:
+            configured = self.settings.snapshot()["library"] if format == "serato" else ""
+            if not configured:
+                try:
+                    found = find_source(format)
+                    configured = str(found) if found else ""
+                except OSError as error:
+                    LOG.warning("Source library discovery failed for %s: %s", format, error)
+                    discovery_error = str(error)
+                    configured = ""
+        self.active_source_format = format
+        self.source_path.blockSignals(True)
+        self.source_path.setText(configured)
+        self.source_path.blockSignals(False)
+        try:
+            paths[format] = configured
+            self.settings.update(source_format=format, source_path=configured, source_paths=paths)
+        except OSError as error:
+            LOG.exception("Could not save selected source")
+            self.show_error("Source settings could not be saved", str(error))
+        self.source_changed()
+        if discovery_error is not None:
+            self.library_status.setText(f"Cannot check usual library paths: {discovery_error}. Choose a path manually.")
+
+    def source_changed(self, *args):
+        self.crate_tree.clear()
+        self.crates_loaded = False
+        format, path = self.current_source()
+        self.source_hint.setText(source_guidance(format))
+        status_style(self.library_status, "neutral")
+        source = source_definition(format)
+        try:
+            exists = source_exists(format, path)
+        except OSError as error:
+            LOG.warning("Could not check source library path: %s", error)
+            self.library_status.setText(f"Cannot access this library path: {error}. Choose another path.")
+        else:
+            if not exists:
+                self.library_status.setText(
+                    f"No existing library for {source.name} found. Choose or configure its source path."
+                    + (f"\n{source.reason}" if not source.enabled else "")
+                )
+            elif not source.enabled:
+                self.library_status.setText(source.reason)
+            else:
+                self.library_status.setText("Source selected. Refresh library to see its crates/playlists.")
+        self.refresh_button.setEnabled(source.enabled and not self.loading and not self.sending)
+        self.selection_changed()
+
+    def choose_source(self):
+        if self.loading or self.sending:
+            return
+        format = self.source_format.currentData()
+        if format in ("serato", "serato3", "engine", "djay", "mixxx", "m3u"):
+            chosen = QFileDialog.getExistingDirectory(self, "Choose source library / playlist folder", self.source_path.text())
+        else:
+            chosen, _ = QFileDialog.getOpenFileName(
+                self, "Choose DJ library or exchange file", self.source_path.text(),
+                "DJ libraries and exchange files (*.db *.sqlite *.xml *.nml);;All files (*)",
+            )
+        if chosen:
+            self.source_path.setText(chosen)
+            self.save_source_path()
+            self.load_crates()
+
     def load_crates(self):
         if self.loading or self.sending:
             return
+        format, path = self.current_source()
+        try:
+            exists = source_exists(format, path)
+        except OSError as error:
+            LOG.warning("Could not check selected source path: %s", error)
+            self.crate_tree.clear()
+            self.crates_loaded = False
+            self.selection_changed()
+            self.library_status.setText(f"Cannot access this library path: {error}. Choose another path.")
+            return
+        if not source_definition(format).enabled or not exists:
+            self.source_changed()
+            return
         self.loading = True
         self.refresh_button.setEnabled(False)
-        self.library_status.setText("Reading Serato 4 crate list...")
-        library = Library(self.settings.snapshot()["library"])
+        self.library_status.setText("Reading source playlist list...")
+        source_path = self.source_path.text().strip()
+        self.source_format.setEnabled(False)
+        self.source_path.setEnabled(False)
+
+        def read_source():
+            crates = source_library(format, path).crates()
+            paths = self.settings.snapshot()["source_paths"]
+            paths[format] = source_path
+            self.settings.update(source_format=format, source_path=source_path, source_paths=paths)
+            return crates
 
         def done(crates):
             self.loading = False
+            self.source_format.setEnabled(True)
+            self.source_path.setEnabled(True)
             self.refresh_button.setEnabled(True)
             self.crate_tree.clear()
             self.crates_loaded = crates is not None
@@ -514,12 +716,12 @@ class Window(QMainWindow):
                 nodes[path].setData(0, Qt.ItemDataRole.UserRole, crate["id"])
                 nodes[path].setToolTip(0, " / ".join(crate["path"]))
             self.crate_tree.expandToDepth(0)
-            self.library_status.setText(f"{len(crates)} normal crates / Serato 4 SQLite library / source files stay untouched")
+            self.library_status.setText(f"{len(crates)} playlists / {self.source_format.currentText()} / source files stay untouched")
             status_style(self.library_status, "neutral")
             self.filter_crates()
             self.selection_changed()
 
-        self.run_task(library.crates, done)
+        self.run_task(read_source, done)
 
     def all_items(self):
         def descend(parent):
@@ -538,6 +740,7 @@ class Window(QMainWindow):
         selected = self.selected_crates()
         self.selection_status.setText(f"{len(selected)} selected / includes subcrates" if selected else "No crates selected")
         self.send_button.setEnabled(bool(selected) and self.target.currentData() is not None and not self.sending)
+        self.export_button.setEnabled(bool(selected) and not self.sending)
 
     def filter_crates(self):
         query = self.search.text().casefold().strip()
@@ -554,16 +757,30 @@ class Window(QMainWindow):
         if not selected or peer_id is None or self.sending:
             return
         peer = self.settings.snapshot()["peers"][peer_id]
+        source_format, source_path = self.current_source()
+        destination = self.destination_format.currentData()
+        detail = (f"Create {OUTPUT_NAMES[destination]} on {peer['name']}?\n\n"
+                  + (METADATA_WARNING if destination == "m3u" else
+                     "An exchange file is created for manual import, not automatic native integration. "
+                     "OneLibrary export is unavailable.")
+                  + "\nThe receiver must enable export reception; its native libraries will not be changed."
+                  if destination not in NATIVE_DESTINATIONS else
+                  f"Send the selected crates, their subcrates and referenced music files to {peer['name']}?\n\n"
+                  "Original crate names are preserved, with a number added only for name collisions. "
+                  "Existing crates will not be merged or replaced. "
+                  + ("Serato must be closed on that computer. Database-only performance metadata is "
+                     "not converted; repeated tracks are kept once per crate." if destination == "serato" else
+                     f"{NATIVE_NAMES[destination]} must be closed on that computer. Native registration is a preview. "
+                     "Check Activity for unsupported metadata and analysis warnings, and verify playback in the DJ app."))
         answer = QMessageBox.question(
-            self, "Send crates and music?",
-            f"Send the selected crates, their subcrates and referenced music files to {peer['name']}?\n\n"
-            "Original crate names are preserved, with a number added only for name collisions. "
-            "Existing crates will not be merged or replaced. "
-            "Serato must be closed on that computer.",
+            self, "Send crates and music?", detail + "\n\n" + "\n\n".join(
+                compatibility_warnings(source_format, destination)),
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         self.sending = True
+        self.source_format.setEnabled(False)
+        self.source_path.setEnabled(False)
         self.cancel_send.clear()
         self.cancel_send_button.setEnabled(True)
         self.refresh_button.setEnabled(False)
@@ -572,12 +789,153 @@ class Window(QMainWindow):
 
         def done(result):
             self.sending = False
+            self.source_format.setEnabled(True)
+            self.source_path.setEnabled(True)
             self.cancel_send_button.setEnabled(False)
             self.refresh_button.setEnabled(True)
             self.selection_changed()
             self.refresh_activity()
 
-        self.run_task(lambda: send_crates(self.agent, selected, peer_id, self.cancel_send.is_set), done)
+        self.run_task(lambda: send_crates(
+            self.agent, selected, peer_id, self.cancel_send.is_set, destination=destination,
+            source_format=source_format, source_path=source_path,
+        ), done)
+
+    def export_portable(self):
+        selected = self.selected_crates()
+        if not selected or self.sending:
+            return
+        destination = self.destination_format.currentData()
+        source_format, source_path = self.current_source()
+        if destination in NATIVE_DESTINATIONS:
+            directory = self.settings.snapshot()["music"]
+            message = ("Import the selected playlists into the local Serato library? Quit Serato first. "
+                       "Exchange-file database metadata is not converted into Serato; embedded media stays unchanged."
+                       if destination == "serato" else
+                       f"Import playlists and register media in the configured local {NATIVE_NAMES[destination]} library? "
+                       "Quit that DJ app first. This is a preview: verify file access/playback in the destination. "
+                       "Full analysis is not generated; read Activity warnings.")
+        else:
+            directory = QFileDialog.getExistingDirectory(
+                self, "Export folder or mounted USB (not OneLibrary)", self.settings.snapshot()["exports"],
+            )
+            if not directory:
+                return
+            message = (METADATA_WARNING if destination == "m3u" else
+                       "Create an exchange file and media for manual import in the DJ app. "
+                       "This is not automatic native integration or OneLibrary export.")
+        message += "\n\n" + "\n\n".join(compatibility_warnings(source_format, destination))
+        title = "Convert native playlists?" if destination in NATIVE_DESTINATIONS else "Export portable playlists?"
+        if QMessageBox.question(self, title,
+                                f"{message}\n\nDestination:\n{directory}") != \
+                QMessageBox.StandardButton.Yes:
+            return
+        self.sending = True
+        self.source_format.setEnabled(False)
+        self.source_path.setEnabled(False)
+        self.cancel_send.clear()
+        self.cancel_send_button.setEnabled(True)
+        self.refresh_button.setEnabled(False)
+        self.selection_changed()
+        self.page(2)
+
+        def done(result):
+            self.sending = False
+            self.source_format.setEnabled(True)
+            self.source_path.setEnabled(True)
+            self.cancel_send_button.setEnabled(False)
+            self.refresh_button.setEnabled(True)
+            self.selection_changed()
+            self.refresh_activity()
+
+        self.run_task(lambda: export_local(
+            self.agent, selected, Path(directory), self.cancel_send.is_set, destination=destination,
+            source_format=source_format, source_path=source_path,
+        ), done)
+
+    def save_music_settings(self):
+        if self.active_tasks or self.agent.session:
+            self.show_error("Agent is busy", "Finish or cancel operations before changing the received-music folder.")
+            return
+        try:
+            raw = self.music_input.text().strip()
+            if not raw:
+                raise ValueError("Choose a received-music folder.")
+            music = Path(raw).expanduser().resolve()
+            parent = music
+            while not parent.exists():
+                parent = parent.parent
+            if not parent.is_dir() or not os.access(parent, os.W_OK):
+                raise ValueError("Choose a writable received-music folder or parent directory.")
+            self.settings.update(music=str(music))
+        except (ValueError, OSError) as error:
+            self.show_error("Received music settings were not saved", str(error))
+            return
+        QMessageBox.information(self, "Received music folder saved",
+                                "Applies to subsequent native transfers. Each destination validates its own "
+                                "library and volume requirements before importing. Existing media is not moved.")
+
+    def save_portable_settings(self):
+        if self.active_tasks or self.agent.session:
+            self.show_error("Agent is busy", "Finish or cancel current operations before changing export reception.")
+            return
+        try:
+            directory = Path(self.exports_input.text().strip()).expanduser().resolve()
+            if not self.exports_input.text().strip() or not directory.is_dir():
+                raise ValueError("Choose an existing portable export folder or mounted USB volume.")
+            self.settings.update(exports=str(directory), portable_receive=self.portable_receive_input.isChecked())
+        except (ValueError, OSError) as error:
+            self.show_error("Portable export settings were not saved", str(error))
+            return
+        QMessageBox.information(self, "Portable export settings saved",
+                                "Export reception takes effect immediately. Formats are selected by the sender; "
+                                "only exchange files and media are created here. Native libraries are not changed.")
+
+    def save_djay_settings(self):
+        if self.active_tasks or self.agent.session:
+            self.show_error("Agent is busy", "Finish or cancel current operations before changing native reception.")
+            return
+        try:
+            path = self.djay_library_input.text().strip()
+            enabled = self.djay_receive_input.isChecked()
+            if enabled:
+                from .djay import DjayLibrary, assert_djay_closed
+                assert_djay_closed()
+                library = DjayLibrary(path)
+                music = Path(self.settings.snapshot()["music"]).expanduser()
+                library.validate_destination(music)
+                path = str(library.path)
+            self.settings.update(djay_library=path, djay_receive=enabled)
+        except (ValueError, OSError) as error:
+            self.show_error("djay destination settings were not saved", str(error))
+            return
+        QMessageBox.information(self, "djay destination saved",
+                                "Native reception is opt-in and requires djay closed. Imports are backed up. "
+                                "New-file access and playback must be verified in djay.")
+
+    def save_native_settings(self, format):
+        if self.active_tasks or self.agent.session:
+            self.show_error("Agent is busy", "Finish or cancel operations before changing native reception.")
+            return
+        try:
+            path = self.native_library_inputs[format].text().strip()
+            enabled = self.native_receive_inputs[format].isChecked()
+            if enabled:
+                library, guard = native_library(format, path)
+                guard()
+                library.validate_destination(Path(self.settings.snapshot()["music"]).expanduser())
+                path = str(library.path)
+            settings = self.settings.snapshot()
+            libraries = settings["native_libraries"]
+            reception = settings["native_receive"]
+            libraries[format], reception[format] = path, enabled
+            self.settings.update(native_libraries=libraries, native_receive=reception)
+        except (ValueError, OSError) as error:
+            self.show_error("Native destination settings were not saved", str(error))
+            return
+        QMessageBox.information(self, "Native destination saved",
+                                f"{NATIVE_NAMES[format]} native reception is opt-in and requires the DJ app closed. "
+                                "Keep backups and verify playback after import.")
 
     def allow_pairing(self):
         code = self.agent.pairing()
@@ -770,8 +1128,8 @@ class Window(QMainWindow):
         self.own_name.setText(name)
         self.library_input.setText(str(resolved_library.directory))
         self.addresses.setText(f"Port {self.port} / default receive folder: {music}")
-        self.crates_loaded = False
-        self.load_crates()
+        if self.current_source()[0] == "serato" and not self.settings.snapshot()["source_paths"].get("serato"):
+            self.source_path.setText(str(resolved_library.directory))
         QMessageBox.information(self, "Settings saved",
                                 "Folders saved. Restart the app to apply the computer name or port change."
                                 if restart else "Settings saved. Incoming transfers will use your chosen music folder.")
@@ -781,6 +1139,22 @@ class Window(QMainWindow):
         dialog.setTextFormat(Qt.TextFormat.PlainText)
         dialog.setStyleSheet("QLabel { color: #ff737d; font-weight: 700; }")
         dialog.exec()
+
+    def save_agent_preferences(self):
+        if self.sending or self.loading or self.agent.session:
+            self.show_error("Operation in progress", "Wait until the current operation finishes before changing settings.")
+            return
+        try:
+            name = label(self.name_input.text().strip(), 100)
+            if self.startup_input.isChecked() != startup.enabled():
+                startup.configure(self.startup_input.isChecked(), self.settings.directory)
+            self.settings.update(name=name, port=self.port_input.value())
+        except (ValueError, OSError) as error:
+            self.show_error("Agent preferences were not saved", str(error))
+            return
+        self.own_name.setText(name)
+        QMessageBox.information(self, "Agent preferences saved",
+                                "Restart to apply name or port changes. No DJ library was opened or validated.")
 
     def open_folder(self, path):
         path = path.expanduser()

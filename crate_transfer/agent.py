@@ -16,9 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .config import Settings, atomic_json
+from .catalog import source_exists, source_library
+from .native import NATIVE_NAMES, backup_size as native_backup_size, destination_enabled, destination_path, native_library
 from .identity import client_context, identity
-from .library import Library, assert_serato_closed, sha256_file
-from .protocol import MAX_JSON, ProtocolError, identifier, label, machine_id, validate_manifest
+from .library import Library, NativeImportUncertain, assert_serato_closed, sha256_file
+from .compatibility import add_compatibility_warnings
+from .portable import export_bundle, safe_component
+from .protocol import DESTINATIONS, NATIVE_DESTINATIONS, MAX_JSON, PROTOCOL, ProtocolError, identifier, label, machine_id, validate_manifest
 
 LOG = logging.getLogger(__name__)
 
@@ -62,8 +66,8 @@ class Agent:
                 self.startup_warning = (
                     f"The transfer history could not be read: {error}\n\n"
                     f"The original file was preserved at:\n{backup}\n\n"
-                    "Activity has been reset. Pairings, settings, music and Serato databases "
-                    "were not changed. Check Serato and backups on both computers before "
+                    "Activity has been reset. Pairings, settings, music and DJ libraries "
+                    "were not changed. Check destination libraries and backups on both computers before "
                     "resending any previous transfer, especially an uncertain one. "
                     "Previous transfer receipts are unavailable until the history is repaired."
                 )
@@ -75,11 +79,12 @@ class Agent:
                 if job["status"] not in ("complete", "failed", "uncertain"):
                     was_importing = job["status"] == "importing"
                     job.update(status="uncertain" if was_importing else "failed",
-                               detail=("Interrupted during import: inspect Serato and the backup before resending."
+                               detail=("Interrupted during import: inspect the destination library/output and backups before resending."
                                        if was_importing else "Interrupted by agent shutdown. Send again manually."))
             self.save_jobs()
-        incoming = Path(settings.snapshot()["music"]).expanduser().resolve() / ".crate-transfer-incoming"
         for job in self.jobs:
+            folder_key = "exports" if job.get("format") in ("m3u", "rekordbox-xml", "traktor-nml") else "music"
+            incoming = Path(settings.snapshot()[folder_key]).expanduser().resolve() / ".crate-transfer-incoming"
             job_id = job["id"]
             if len(job_id) == 32 and all(c in "0123456789abcdef" for c in job_id):
                 abandoned = incoming / job_id
@@ -115,6 +120,8 @@ class Agent:
         with self.lock:
             if not isinstance(payload, dict):
                 raise ProtocolError("Invalid pairing request.")
+            if payload.get("protocol") != PROTOCOL:
+                raise ProtocolError("Incompatible pairing protocol. Update Crate Transfer on both computers.")
             if time.monotonic() > self.pair_until or self.pair_attempts >= 5:
                 raise ProtocolError("Pairing is closed. Generate a new code on the receiving computer.")
             self.pair_attempts += 1
@@ -160,21 +167,42 @@ class Agent:
 
     def begin(self, manifest: dict, peer_id: str) -> dict:
         validate_manifest(manifest)
+        if "source_format" in manifest:
+            add_compatibility_warnings(manifest, manifest["source_format"], manifest["destination"]["format"])
         if manifest["sender_id"] != peer_id:
             raise PermissionError("Manifest computer identity does not match the paired computer.")
         with self.lock:
             self._expire()
             if self.session:
                 raise TransferError("The other computer is busy. Finish or cancel its current transfer first.")
-            self.guard()
             settings = self.settings.snapshot()
-            library = Library(settings["library"])
-            music = Path(settings["music"]).expanduser().resolve()
-            library.validate_destination(music)
+            destination_format = manifest["destination"]["format"]
+            portable = destination_format not in NATIVE_DESTINATIONS
+            library = None
+            guard = self.guard
+            backup_size = 0
+            if portable:
+                if settings["portable_receive"] is not True:
+                    raise TransferError("Portable export reception is disabled on the receiving computer.")
+                music = Path(settings["exports"]).expanduser().resolve()
+                if not music.is_dir():
+                    raise TransferError("Configure an existing portable export folder on the receiving computer.")
+            else:
+                if destination_format != "serato":
+                    if not destination_enabled(settings, destination_format):
+                        raise TransferError(f"Native {NATIVE_NAMES[destination_format]} reception is disabled. "
+                                            "Configure and enable it in Settings.")
+                    library, guard = native_library(destination_format, destination_path(settings, destination_format))
+                else:
+                    library = Library(settings["library"])
+                guard()
+                music = Path(settings["music"]).expanduser().resolve()
+                library.validate_destination(music)
+                backup_size = (native_backup_size(library) if destination_format != "serato" else
+                               sum((library.directory / filename).stat().st_size
+                                   for filename in ("root.sqlite", "master.sqlite")))
             music.mkdir(parents=True, exist_ok=True)
-            required = sum(item["size"] for item in manifest["files"])
-            backup_size = sum((library.directory / filename).stat().st_size
-                              for filename in ("root.sqlite", "master.sqlite"))
+            required = sum(item["size"] for item in manifest["files"]) * (2 if portable else 1)
             same_volume = os.stat(music).st_dev == os.stat(self.settings.directory).st_dev
             overhead = backup_size if same_volume else 0
             if (shutil.disk_usage(music).free < required + overhead + 256 * 1024**2
@@ -185,10 +213,11 @@ class Agent:
             staging = music / ".crate-transfer-incoming" / session_id
             staging.mkdir(parents=True, mode=0o700)
             self.session = {"id": session_id, "peer": peer_id, "manifest": manifest, "music": music,
-                            "library": library, "staging": staging, "received": set(),
+                            "library": library, "guard": guard, "portable": portable, "staging": staging, "received": set(),
                             "touched": time.monotonic()}
             self.job(session_id, direction="receive", peer=manifest["sender_name"], status="receiving",
-                     owner=peer_id, detail=f"Waiting for {len(manifest['files'])} files", progress=0)
+                     owner=peer_id, format=manifest["destination"]["format"],
+                     detail=f"Waiting for {len(manifest['files'])} files", progress=0)
             return {"id": session_id}
 
     def require_session(self, session_id, peer_id):
@@ -241,7 +270,9 @@ class Agent:
             manifest = session["manifest"]
             if len(session["received"]) != len(manifest["files"]):
                 raise TransferError("Not all files have been verified.")
-            self.guard()
+            if session["portable"]:
+                return self.finish_portable(session, peer_id)
+            session["guard"]()
             installed, created, directories = {}, [], []
             committed = False
             try:
@@ -252,14 +283,7 @@ class Agent:
                 for item in manifest["files"]:
                     folder = session["music"]
                     for part in file_crates[item["id"]]:
-                        safe = "".join("_" if c in '/\\<>:"|?*' else c for c in part).rstrip(". ")
-                        safe = safe.encode("utf-8")[:180].decode("utf-8", errors="ignore")
-                        if not safe or safe in (".", "..") or safe.startswith(".") or safe.split(".")[0].upper() in {
-                            "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
-                            *(f"LPT{i}" for i in range(1, 10)),
-                        }:
-                            safe = "_" + safe
-                        folder = folder / safe
+                        folder = folder / safe_component(part)
                         if folder.is_symlink():
                             raise TransferError("Destination contains an unexpected symbolic link.")
                         if not folder.exists():
@@ -282,16 +306,31 @@ class Agent:
                         os.link(session["staging"] / item["id"], destination)
                         created.append(destination)
                     installed[item["id"]] = destination
-                self.job(session_id, status="importing", detail="Backing up and importing Serato 4 library")
+                destination_format = manifest["destination"]["format"]
+                destination_name = NATIVE_NAMES[destination_format]
+                self.job(session_id, status="importing", detail=f"Backing up and importing {destination_name} library")
                 result = session["library"].import_crates(
                     manifest, installed, self.settings.directory / "backups" / session_id,
-                    session_id, guard=self.guard,
+                    session_id, guard=session["guard"],
                 )
+                result["format"] = destination_format
+                warnings = list(manifest.get("warnings", [])) + list(result.get("warnings", []))
+                repeated = sum(len(crate["tracks"]) for crate in manifest["crates"]) - result["memberships"]
+                if repeated and destination_format == "serato":
+                    warnings.append(
+                        f"Serato keeps one occurrence of each track per crate; {repeated} repeated entries were omitted."
+                    )
+                if destination_format == "serato" and any(item.get("metadata") for item in manifest["files"]):
+                    warnings.append("Serato import does not convert exchange-file cues, loops, BPM/key or beatgrids. "
+                                    "Embedded media bytes remain unchanged.")
+                result["warnings"] = warnings
                 committed = True
                 self.job(session_id, owner=peer_id, status="complete", progress=1,
-                         detail=f"Imported {result['crates']} crates. Open Serato to load them.", result=result)
+                         detail=f"Imported {result['crates']} playlists. Open {destination_name} to load them."
+                                + ("\n" + "\n".join(warnings) if warnings else ""), result=result)
                 return result
             except BaseException as error:
+                committed = committed or isinstance(error, NativeImportUncertain)
                 if not committed:
                     for path in created:
                         path.unlink()
@@ -309,6 +348,29 @@ class Agent:
                     self.job(session_id, detail=current["detail"] + f" Staging cleanup failed: {error}")
                 finally:
                     self.session = None
+
+    def finish_portable(self, session: dict, peer_id: str):
+        committed = False
+        try:
+            self.job(session["id"], status="importing", detail="Creating verified portable playlists and files")
+            sources = {item["id"]: session["staging"] / item["id"] for item in session["manifest"]["files"]}
+            result = export_bundle(session["manifest"], sources, session["music"], session["id"],
+                                   format=session["manifest"]["destination"]["format"])
+            committed = True
+            self.job(session["id"], owner=peer_id, status="complete", progress=1,
+                     detail=f"Export created: {result['output']}\n" + "\n".join(result["warnings"]), result=result)
+            return result
+        except BaseException as error:
+            self.job(session["id"], status="uncertain" if committed else "failed", detail=str(error))
+            raise
+        finally:
+            try:
+                shutil.rmtree(session["staging"])
+            except OSError as error:
+                LOG.exception("Could not remove portable receive staging: %s", session["staging"])
+                current = next(job for job in self.history() if job["id"] == session["id"])
+                self.job(session["id"], detail=current["detail"] + f" Staging cleanup failed: {error}")
+            self.session = None
 
     def cancel(self, session_id, peer_id):
         with self.lock:
@@ -412,17 +474,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self):
         agent = self.server.agent
-        if self.command == "GET" and self.path == "/v1/info":
+        if self.command == "GET" and self.path == "/api/info":
             settings = agent.settings.snapshot()
-            return {"version": 1, "id": settings["id"], "name": settings["name"], "pairing_version": 2}
-        if self.command == "POST" and self.path == "/v1/pair":
+            destinations = ["serato"] if source_exists("serato", settings["library"]) else []
+            for format in NATIVE_DESTINATIONS:
+                if format != "serato" and destination_enabled(settings, format) and source_exists(
+                    format, destination_path(settings, format),
+                ):
+                    destinations.append(format)
+            if settings["portable_receive"] is True:
+                destinations.extend(format for format in DESTINATIONS if format not in NATIVE_DESTINATIONS)
+            return {"protocol": PROTOCOL, "id": settings["id"], "name": settings["name"],
+                    "bidirectional_pairing": True,
+                    "destinations": destinations}
+        if self.command == "POST" and self.path == "/api/pair":
             return agent.pair(self.read_json(), self.client_address[0])
         authorization = self.headers.get("Authorization", "")
         peer = agent.authorize(authorization.removeprefix("Bearer "))
         parts = self.path.strip("/").split("/")
-        if self.command == "POST" and parts == ["v1", "transfers"]:
+        if self.command == "POST" and parts == ["api", "transfers"]:
             return agent.begin(self.read_json(), peer)
-        if len(parts) >= 3 and parts[:2] == ["v1", "transfers"]:
+        if len(parts) >= 3 and parts[:2] == ["api", "transfers"]:
             session_id = parts[2]
             if self.command == "GET" and len(parts) == 3:
                 job = next((job for job in agent.history()
@@ -520,13 +592,14 @@ def pair_computer(settings: Settings, host, port, fingerprint, code):
         finally:
             connection.close()
     client = Client(host, port, fingerprint)
-    if client.request("GET", "/v1/info").get("pairing_version") != 2:
+    info = client.request("GET", "/api/info")
+    if info.get("protocol") != PROTOCOL or info.get("bidirectional_pairing") is not True:
         raise TransferError("Update Crate Transfer on the other computer to enable send-and-receive pairing.")
     own = settings.snapshot()
     _, own_fingerprint = identity(settings.directory)
     reverse_token = secrets.token_hex(32)
-    result = client.request("POST", "/v1/pair", {
-        "id": own["id"], "name": own["name"], "code": code,
+    result = client.request("POST", "/api/pair", {
+        "protocol": PROTOCOL, "id": own["id"], "name": own["name"], "code": code,
         "reverse": {"fingerprint": own_fingerprint, "token": reverse_token, "port": own["port"]},
     })
     if result.get("bidirectional") is not True:
@@ -539,7 +612,8 @@ def pair_computer(settings: Settings, host, port, fingerprint, code):
     settings.update(peers=own["peers"], trusted=own["trusted"])
 
 
-def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambda: False):
+def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambda: False,
+                destination="serato", source_format=None, source_path=None):
     job_id = uuid.uuid4().hex
     own = agent.settings.snapshot()
     peer = own["peers"][peer_id]
@@ -556,13 +630,32 @@ def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambd
             check_cancelled()
             agent.job(job_id, detail=text)
 
-        manifest, paths = Library(own["library"]).export(selected, own["id"], own["name"],
-                                                       preparing)
+        if destination not in DESTINATIONS:
+            raise TransferError("Unsupported destination. No files were sent.")
+        check_cancelled()
+        info = client.request("GET", "/api/info")
+        if info.get("protocol") != PROTOCOL:
+            raise TransferError("Incompatible receiver. Update Crate Transfer on both computers. No files were sent.")
+        if info.get("id") != peer_id:
+            raise TransferError("The remote machine identity differs from the saved pairing. No files were sent.")
+        if destination not in info.get("destinations", []):
+            raise TransferError("The receiver has not enabled this destination. Configure its native library "
+                                "and reception opt-in, or enable export reception for exchange files, "
+                                "in its Settings. No files were sent.")
+        format = source_format or own["source_format"]
+        path = source_path if source_path is not None else own["source_paths"].get(
+            format, own["library"] if format == "serato" else own["source_path"],
+        )
+        manifest, paths = source_library(format, path).export(selected, own["id"], own["name"], preparing)
+        manifest["destination"] = {"format": destination}
+        add_compatibility_warnings(manifest, format, destination)
+        if manifest.get("warnings"):
+            preparing("Compatibility / conversion warnings:\n" + "\n".join(manifest["warnings"]))
         check_cancelled()
         validate_manifest(manifest)
         if len(json.dumps(manifest).encode()) > MAX_JSON:
             raise ProtocolError("Selected crates exceed the 8 MiB manifest limit. Send fewer crates.")
-        remote_id = client.request("POST", "/v1/transfers", manifest)["id"]
+        remote_id = client.request("POST", "/api/transfers", manifest)["id"]
         total, sent = sum(item["size"] for item in manifest["files"]), 0
         last_report = 0.0
 
@@ -577,19 +670,26 @@ def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambd
         for index, item in enumerate(manifest["files"]):
             check_cancelled()
             agent.job(job_id, status="sending", detail=f"{index + 1}/{len(paths)}  {item['name']}")
-            client.request("PUT", f"/v1/transfers/{remote_id}/files/{item['id']}",
+            client.request("PUT", f"/api/transfers/{remote_id}/files/{item['id']}",
                            file=paths[item["id"]], progress=progress)
         check_cancelled()
-        agent.job(job_id, status="importing", detail="The other computer is backing up and importing the crates", progress=1,
+        processing = ("The other computer is creating a playlist export" if destination not in NATIVE_DESTINATIONS
+                      else "The other computer is backing up and importing the crates")
+        agent.job(job_id, status="importing", detail=processing, progress=1,
                   remote_id=remote_id)
         finishing = True
         try:
-            result = client.request("POST", f"/v1/transfers/{remote_id}/finish", timeout=600)
+            result = client.request("POST", f"/api/transfers/{remote_id}/finish", timeout=600)
         except (OSError, http.client.HTTPException):
             agent.job(job_id, detail="Connection interrupted during import. Checking the other computer; do not resend.",
                       remote_id=remote_id)
             result = recover_receipt(client, remote_id)
-        agent.job(job_id, status="complete", detail=f"{result['crates']} crates delivered. Open Serato on {peer['name']}.",
+        detail = (f"Export created on {peer['name']}: {result['output']}"
+                  if destination not in NATIVE_DESTINATIONS else
+                  f"{result['crates']} playlists delivered. Open {destination} on {peer['name']}.")
+        if result.get("warnings"):
+            detail += "\n" + "\n".join(result["warnings"])
+        agent.job(job_id, status="complete", detail=detail,
                   result=result, remote_id=remote_id)
         return result
     except Exception as error:
@@ -601,9 +701,63 @@ def send_crates(agent: Agent, selected: list[int], peer_id: str, cancelled=lambd
         agent.job(job_id, status="uncertain" if uncertain else "failed", detail=detail, remote_id=remote_id)
         if remote_id and not finishing:
             try:
-                client.request("DELETE", f"/v1/transfers/{remote_id}")
+                client.request("DELETE", f"/api/transfers/{remote_id}")
             except Exception:
                 LOG.exception("Could not cancel remote receive session; cancel it on the receiver")
+        raise
+
+
+def export_local(agent: Agent, selected: list[int], directory: Path, cancelled=lambda: False,
+                 destination="m3u", source_format=None, source_path=None):
+    export_id = uuid.uuid4().hex
+    own = agent.settings.snapshot()
+    agent.job(export_id, direction="export", peer="This computer", status="preparing", progress=0,
+              detail="Reading selected playlists for local conversion")
+    committed = False
+    try:
+        def progress(message):
+            if cancelled():
+                raise TransferError("Export cancelled. No output was published.")
+            agent.job(export_id, detail=message)
+
+        if destination not in DESTINATIONS:
+            raise TransferError("Unsupported local destination.")
+        progress("Reading selected playlists")
+        format = source_format or own["source_format"]
+        path = source_path if source_path is not None else own["source_paths"].get(
+            format, own["library"] if format == "serato" else own["source_path"],
+        )
+        manifest, paths = source_library(format, path).export(selected, own["id"], own["name"], progress)
+        manifest["destination"] = {"format": destination}
+        add_compatibility_warnings(manifest, format, destination)
+        if manifest.get("warnings"):
+            progress("Compatibility / conversion warnings:\n" + "\n".join(manifest["warnings"]))
+        if destination in NATIVE_DESTINATIONS:
+            progress(f"Preparing local {destination} import")
+            session_id = agent.begin(manifest, own["id"])["id"]
+            try:
+                for item in manifest["files"]:
+                    progress(f"Staging {item['name']}")
+                    with paths[item["id"]].open("rb") as source:
+                        agent.upload(session_id, item["id"], own["id"], item["size"], source)
+                progress(f"Importing into local {destination} library")
+                result = agent.finish(session_id, own["id"])
+            except BaseException:
+                if agent.session and agent.session["id"] == session_id:
+                    agent.cancel(session_id, own["id"])
+                raise
+        else:
+            result = export_bundle(manifest, paths, directory, export_id, progress, cancelled, format=destination)
+        committed = True
+        agent.job(export_id, status="complete", progress=1, result=result,
+                  detail=(f"Export created: {result['output']}" if destination not in NATIVE_DESTINATIONS
+                          else f"Imported {result['crates']} playlists into local {destination}.")
+                         + ("\n" + "\n".join(result["warnings"]) if result.get("warnings") else ""))
+        return result
+    except Exception as error:
+        LOG.exception("Local conversion failed")
+        committed = committed or isinstance(error, NativeImportUncertain)
+        agent.job(export_id, status="uncertain" if committed else "failed", detail=str(error))
         raise
 
 
@@ -611,7 +765,7 @@ def recover_receipt(client: Client, remote_id: str, wait_seconds=600):
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            status = client.request("GET", f"/v1/transfers/{remote_id}", timeout=10)
+            status = client.request("GET", f"/api/transfers/{remote_id}", timeout=10)
         except (OSError, http.client.HTTPException) as error:
             LOG.warning("Could not check remote import outcome: %s", error)
         else:

@@ -1,11 +1,12 @@
 import sys
+from PyInstaller.utils.hooks import copy_metadata
 
 analysis = Analysis(
     ["launcher.py"],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=copy_metadata("pyrekordbox") + copy_metadata("sqlcipher3-wheels"),
+    hiddenimports=["sqlalchemy.dialects.sqlite.pysqlcipher", "sqlcipher3.dbapi2"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -47,8 +48,8 @@ if sys.platform == "darwin":
         icon="assets/CrateTransfer.icns",
         info_plist={
             "NSHighResolutionCapable": True,
-            "NSLocalNetworkUsageDescription": "Discover paired computers and transfer selected Serato crates and music over your local network.",
-            "NSBonjourServices": ["_seratocrate._tcp"],
+            "NSLocalNetworkUsageDescription": "Discover paired computers and transfer selected DJ playlists, crates and music over your local network.",
+            "NSBonjourServices": ["_cratetransfer._tcp"],
             "LSMinimumSystemVersion": "12.0",
         },
     )

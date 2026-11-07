@@ -15,8 +15,8 @@ from .ui import STYLE, Window, app_icon
 
 def main():
     parser = argparse.ArgumentParser(description="Crate Transfer desktop agent")
-    parser.add_argument("--data-dir", type=Path, help="Override agent settings directory (not Serato's Library)")
-    parser.add_argument("--smoke-test", action="store_true", help="Render UI without LAN services and quit")
+    parser.add_argument("--data-dir", type=Path, help="Override agent settings directory (not DJ libraries)")
+    parser.add_argument("--smoke-test", action="store_true", help="Check native runtime, render UI without LAN services and quit")
     parser.add_argument("--background", action="store_true", help="Start quietly in the menu bar / system tray")
     parser.add_argument("--screenshot", type=Path, help="Save a screenshot during --smoke-test")
     args = parser.parse_args()
@@ -42,10 +42,15 @@ def main():
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(logging.INFO)
+        if args.smoke_test:
+            from .rekordbox import _sdk_factory
+            _sdk_factory()
+            logging.info("Bundled rekordbox SDK and SQLCipher runtime verified without opening DJ libraries.")
         window = Window(settings, start_services=not args.smoke_test)
     except Exception as error:
         logging.exception("Startup failed")
-        QMessageBox.critical(None, "Crate Transfer could not start", str(error))
+        if not args.smoke_test:
+            QMessageBox.critical(None, "Crate Transfer could not start", str(error))
         return 1
     app.setQuitOnLastWindowClosed(False)
     if not args.background or args.smoke_test or not QSystemTrayIcon.isSystemTrayAvailable():

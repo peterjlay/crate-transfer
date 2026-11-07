@@ -3,6 +3,7 @@
 import hashlib
 import sqlite3
 from pathlib import Path
+from crate_transfer.protocol import PROTOCOL
 
 def create_root_database(path, keep_unrelated=True):
     path = Path(path)
@@ -149,7 +150,8 @@ def valid_manifest(items=None, crates=None, sender_id="11111111-1111-4111-8111-1
     if crates is None:
         crates = [{"path": ["Set"], "tracks": [item["id"] for item in items]}]
     return {
-        "version": 1,
+        "protocol": PROTOCOL,
+        "destination": {"format": "serato"},
         "sender_id": sender_id,
         "sender_name": "Synthetic Sender",
         "files": items,

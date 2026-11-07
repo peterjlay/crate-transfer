@@ -15,13 +15,17 @@ from urllib.parse import unquote, urlparse
 
 import psutil
 
-from .protocol import VIDEO
+from .protocol import PROTOCOL, VIDEO
 
 LOG = logging.getLogger(__name__)
 
 
 class LibraryError(ValueError):
     pass
+
+
+class NativeImportUncertain(LibraryError):
+    """Native writes could not be rolled back; retain potentially referenced media."""
 
 
 ROOT_COLUMNS = {
@@ -416,7 +420,8 @@ class Library:
                         path_cache[asset_key] = key
                     members.append(path_cache[asset_key])
                 output.append({"path": crate["path"], "tracks": members})
-        return {"version": 1, "sender_id": machine_id, "sender_name": name,
+        return {"protocol": PROTOCOL, "destination": {"format": "serato"},
+                "sender_id": machine_id, "sender_name": name,
                 "crates": output, "files": list(files.values())}, paths
 
     def validate_destination(self, music: Path) -> None:

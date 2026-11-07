@@ -13,11 +13,19 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QPushButton, QScrollArea
 
 from crate_transfer.config import Settings
-from crate_transfer.ui import PairDialog, STYLE, Window
+from crate_transfer.ui import PairDialog, STYLE, Window, app_icon
 from support import file_record, make_library, valid_manifest
 
 
 class DesktopTests(unittest.TestCase):
+    def test_vinyl_icon_has_orange_label_and_no_transfer_arrow_or_mint_branding(self):
+        image = app_icon(256).pixmap(256, 256).toImage()
+        self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
+        self.assertEqual(image.pixelColor(8 * 4, 32 * 4).name(), "#101114")
+        self.assertEqual(image.pixelColor(32 * 4, 26 * 4).name(), "#d98a47")
+        self.assertEqual(image.pixelColor(32 * 4, 32 * 4).name(), "#101114")
+        self.assertEqual(image.pixelColor(56 * 4, 49 * 4).name(), "#242835")
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -39,6 +47,9 @@ class DesktopTests(unittest.TestCase):
         self.window = Window(self.settings, start_services=False)
         self.errors = []
         self.window.show_error = lambda title, message: self.errors.append((title, message))
+        discovery = patch("crate_transfer.ui.find_source", return_value=None)
+        discovery.start()
+        self.addCleanup(discovery.stop)
 
     def tearDown(self):
         self.wait_for_tasks()
@@ -112,6 +123,100 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(selected, [item.data(0, Qt.ItemDataRole.UserRole)])
         self.assertLess(selected[0], 0)
         self.assertEqual(self.window.selection_status.text(), "1 selected / includes subcrates")
+
+    def test_local_portable_export_is_available_without_a_paired_computer(self):
+        self.load()
+        item = next(i for i in self.window.all_items() if i.text(0) == "House")
+        item.setCheckState(0, Qt.CheckState.Checked)
+        self.assertTrue(self.window.export_button.isEnabled())
+        self.assertFalse(self.window.send_button.isEnabled())
+        output = self.base / "USB"
+        output.mkdir()
+        with patch("crate_transfer.ui.QFileDialog.getExistingDirectory", return_value=str(output)), \
+                patch("crate_transfer.ui.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            self.window.export_portable()
+            self.wait_for_tasks()
+        self.assertEqual(self.window.agent.history()[0]["status"], "complete")
+        self.assertTrue(self.window.export_button.isEnabled())
+        self.assertEqual(self.errors, [])
+        self.assertTrue(list(output.glob("Crates-*")))
+
+    def test_source_changes_clear_stale_selection_and_native_adapters_explain_their_status(self):
+        self.load()
+        self.window.crate_tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
+        self.assertTrue(self.window.export_button.isEnabled())
+        self.window.source_format.setCurrentIndex(self.window.source_format.findData("rekordbox-xml"))
+        self.window.source_path.setText(str(self.base / "collection.xml"))
+        self.assertEqual(self.window.crate_tree.topLevelItemCount(), 0)
+        self.assertFalse(self.window.export_button.isEnabled())
+        self.assertEqual(self.window.current_source(), ("rekordbox-xml", str(self.base / "collection.xml")))
+        for key in ("rekordbox-native", "engine", "virtualdj-native"):
+            item = self.window.source_format.model().item(self.window.source_format.findData(key))
+            self.assertTrue(item.isEnabled())
+            self.assertTrue(item.toolTip())
+        for index in range(self.window.destination_format.count()):
+            item = self.window.destination_format.model().item(index)
+            if self.window.destination_format.itemData(index) is None:
+                self.assertFalse(item.isEnabled())
+                self.assertTrue(item.toolTip())
+
+    def test_m3u_source_refresh_persists_source_and_exposes_playlists_without_serato(self):
+        media = self.base / "song.mp3"
+        media.write_bytes(b"synthetic media")
+        playlist = self.base / "Selected.m3u8"
+        playlist.write_text("#EXTM3U\nsong.mp3\n", encoding="utf-8")
+        self.window.source_format.setCurrentIndex(self.window.source_format.findData("m3u"))
+        self.window.source_path.setText(str(playlist))
+        self.load()
+        self.assertEqual(self.errors, [])
+        self.assertEqual(self.window.crate_tree.topLevelItem(0).text(0), "Selected")
+        self.assertEqual(self.window.crate_tree.topLevelItem(0).text(1), "1")
+        self.assertEqual(self.settings.snapshot()["source_format"], "m3u")
+        self.assertEqual(self.settings.snapshot()["source_path"], str(playlist))
+        self.assertTrue(self.window.source_format.isEnabled())
+        playlist.unlink()
+        self.load()
+        self.assertEqual(self.window.crate_tree.topLevelItemCount(), 0)
+        self.assertEqual(self.errors, [])
+        self.assertIn("No existing library", self.window.library_status.text())
+        self.assertTrue(self.window.source_format.isEnabled())
+
+    def test_local_serato_conversion_routes_to_configured_native_library_without_export_dialog(self):
+        self.load()
+        self.window.crate_tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
+        selected = self.window.selected_crates()
+        self.window.destination_format.setCurrentIndex(self.window.destination_format.findData("serato"))
+        with patch("crate_transfer.ui.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes), \
+                patch("crate_transfer.ui.QFileDialog.getExistingDirectory") as picker, \
+                patch("crate_transfer.ui.export_local", return_value={}) as convert:
+            self.window.export_portable()
+            self.wait_for_tasks()
+            picker.assert_not_called()
+            convert.assert_called_once_with(
+                self.window.agent, selected, Path(self.settings.snapshot()["music"]),
+                self.window.cancel_send.is_set, destination="serato", source_format="serato",
+                source_path=self.settings.snapshot()["library"],
+            )
+        self.assertFalse(self.window.sending)
+        self.assertTrue(self.window.source_format.isEnabled())
+        self.assertEqual(self.errors, [])
+
+    def test_portable_receive_settings_save_independently_of_serato_and_validate_folder(self):
+        before = self.settings.snapshot()
+        self.window.library_input.setText(str(self.base / "no-library"))
+        exports = self.base / "exports"
+        exports.mkdir()
+        self.window.exports_input.setText(str(exports))
+        self.window.portable_receive_input.setChecked(True)
+        with patch("crate_transfer.ui.QMessageBox.information"):
+            self.window.save_portable_settings()
+        self.assertEqual(Settings(self.settings.directory).snapshot(),
+                         dict(before, exports=str(exports.resolve()), portable_receive=True))
+        self.assertEqual(self.errors, [])
+        self.window.exports_input.setText("")
+        self.window.save_portable_settings()
+        self.assertIn("existing portable export folder", self.errors[-1][1])
+        self.assertEqual(self.settings.snapshot()["exports"], str(exports.resolve()))
 
     def test_settings_scroll_at_minimum_window_size_without_clipping_controls(self):
         self.window.resize(980, 650)
@@ -282,18 +387,170 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.errors, [])
         self.assertEqual(self.settings.snapshot()["library"], str(library.resolve()))
         self.assertEqual(self.window.library_input.text(), str(library.resolve()))
+        self.load()
         self.assertEqual([item.text(0) for item in self.window.all_items()], ["Parent-folder set"])
 
-    def test_library_failure_is_visible_and_clears_stale_selection(self):
+    def test_missing_library_is_nonmodal_and_clears_stale_selection(self):
         self.load()
         self.window.all_items()[0].setCheckState(0, Qt.CheckState.Checked)
-        self.settings.update(library=str(self.base / "missing-library"))
+        self.window.source_path.setText(str(self.base / "missing-library"))
         self.window.load_crates()
         self.wait_for_tasks()
-        self.assertIn("Library not found", self.errors[-1][1])
+        self.assertEqual(self.errors, [])
         self.assertEqual(self.window.selected_crates(), [])
         self.assertFalse(self.window.send_button.isEnabled())
-        self.assertIn("Library unavailable", self.window.library_status.text())
+        self.assertIn("No existing library", self.window.library_status.text())
+
+    def test_source_pivot_remembers_independent_paths_and_keeps_destination_separate(self):
+        original = self.window.source_path.text()
+        xml_path = str(self.base / "rekordbox.xml")
+        nml_path = str(self.base / "collection.nml")
+        for format, path in (("rekordbox-xml", xml_path), ("traktor-nml", nml_path)):
+            self.window.source_format.setCurrentIndex(self.window.source_format.findData(format))
+            self.window.source_path.setText(path)
+        self.window.source_format.setCurrentIndex(self.window.source_format.findData("rekordbox-xml"))
+        self.assertEqual(self.window.source_path.text(), xml_path)
+        self.window.source_format.setCurrentIndex(self.window.source_format.findData("serato"))
+        self.assertEqual(self.window.source_path.text(), original)
+        self.assertEqual(self.settings.snapshot()["library"], original)
+        reloaded = Settings(self.settings.directory)
+        self.assertEqual(reloaded.snapshot()["source_paths"]["traktor-nml"], nml_path)
+        self.assertEqual(reloaded.snapshot()["source_paths"]["rekordbox-xml"], xml_path)
+
+    def test_absent_native_source_is_selectable_but_does_not_open_a_library(self):
+        with patch("crate_transfer.ui.source_library") as read:
+            for format in ("engine", "rekordbox-native", "virtualdj-native"):
+                self.window.source_format.setCurrentIndex(self.window.source_format.findData(format))
+                self.window.load_crates()
+                self.assertIn("No existing library", self.window.library_status.text())
+                self.assertTrue(self.window.refresh_button.isEnabled())
+            read.assert_not_called()
+        self.assertEqual(self.errors, [])
+
+    def test_normal_startup_does_not_probe_or_open_any_dj_library(self):
+        self.window.quit()
+        self.window.deleteLater()
+        self.app.processEvents()
+        with patch("crate_transfer.ui.source_library") as library, \
+                patch("crate_transfer.ui.source_exists") as exists, \
+                patch("crate_transfer.ui.Agent.start", return_value=49783), \
+                patch("crate_transfer.ui.Discovery") as discovery, \
+                patch("crate_transfer.ui.Window.show_error") as error:
+            discovery.return_value.snapshot.return_value = []
+            self.settings.update(library=str(self.base / "no-app-installed"), source_paths={})
+            self.window = Window(self.settings, start_services=True)
+            self.app.processEvents()
+            library.assert_not_called()
+            exists.assert_not_called()
+            error.assert_not_called()
+        self.assertIn("No source library opened", self.window.library_status.text())
+
+    def test_agent_preferences_save_without_any_dj_library(self):
+        self.window.library_input.setText(str(self.base / "missing-library"))
+        self.window.name_input.setText("All DJ Apps")
+        with patch("crate_transfer.ui.QMessageBox.information"), \
+                patch("crate_transfer.ui.Library") as library, \
+                patch("crate_transfer.ui.startup.enabled", return_value=False):
+            self.window.save_agent_preferences()
+            library.assert_not_called()
+        self.assertEqual(self.settings.snapshot()["name"], "All DJ Apps")
+        self.assertEqual(self.errors, [])
+
+    def test_shared_music_folder_saves_without_serato4_and_does_not_move_old_media(self):
+        existing = self.base / "old-media"
+        existing.mkdir()
+        (existing / "keep.mp3").write_bytes(b"keep")
+        self.settings.update(library=str(self.base / "missing-dj4"), music=str(existing))
+        self.window.music_input.setText(str(self.base / "new-music"))
+        with patch("crate_transfer.ui.Library") as serato, \
+                patch("crate_transfer.ui.native_library") as native, \
+                patch("crate_transfer.ui.QMessageBox.information"):
+            self.window.save_music_settings()
+            serato.assert_not_called()
+            native.assert_not_called()
+        self.assertEqual(self.settings.snapshot()["music"], str((self.base / "new-music").resolve()))
+        self.assertEqual((existing / "keep.mp3").read_bytes(), b"keep")
+        self.assertFalse((self.base / "new-music").exists())
+        self.assertEqual(self.errors, [])
+
+    def test_native_djay_receive_defaults_off_and_can_be_disabled_without_opening_library(self):
+        self.assertFalse(self.window.djay_receive_input.isChecked())
+        self.window.djay_library_input.setText(str(self.base / "missing-djay"))
+        with patch("crate_transfer.ui.QMessageBox.information"):
+            self.window.save_djay_settings()
+        self.assertFalse(self.settings.snapshot()["djay_receive"])
+        self.assertEqual(self.settings.snapshot()["djay_library"], str(self.base / "missing-djay"))
+        self.assertEqual(self.errors, [])
+
+    def test_all_native_destination_settings_default_off_and_save_without_opening_if_disabled(self):
+        with patch("crate_transfer.ui.native_library") as library, \
+                patch("crate_transfer.ui.QMessageBox.information"):
+            for format in ("serato3", "mixxx", "traktor", "virtualdj-native", "engine", "rekordbox-native"):
+                self.assertFalse(self.window.native_receive_inputs[format].isChecked())
+                path = str(self.base / ("missing-" + format))
+                self.window.native_library_inputs[format].setText(path)
+                self.window.save_native_settings(format)
+                self.assertEqual(self.settings.snapshot()["native_libraries"][format], path)
+                self.assertFalse(self.settings.snapshot()["native_receive"][format])
+                self.assertGreaterEqual(self.window.destination_format.findData(format), 0)
+            library.assert_not_called()
+        self.assertEqual(self.errors, [])
+
+    def test_serato_version_warning_is_shown_before_local_conversion_and_network_send(self):
+        self.load()
+        self.window.all_items()[0].setCheckState(0, Qt.CheckState.Checked)
+        self.window.destination_format.setCurrentIndex(self.window.destination_format.findData("serato3"))
+        with patch("crate_transfer.ui.QMessageBox.question", return_value=QMessageBox.StandardButton.No) as question, \
+                patch("crate_transfer.ui.export_local") as convert:
+            self.window.export_portable()
+            self.assertIn("Version downgrade", question.call_args.args[2])
+            self.assertIn("database-only metadata", question.call_args.args[2])
+            convert.assert_not_called()
+        peer = "22222222-2222-4222-8222-222222222222"
+        self.settings.update(peers={peer: {"id": peer, "name": "DJ 3 Laptop", "host": "127.0.0.1",
+                                           "port": 49783, "fingerprint": "a" * 64, "token": "test-token"}})
+        self.window.refresh_computers()
+        self.window.target.setCurrentIndex(1)
+        with patch("crate_transfer.ui.QMessageBox.question", return_value=QMessageBox.StandardButton.No) as question, \
+                patch("crate_transfer.ui.send_crates") as send:
+            self.window.send()
+            self.assertIn("Version downgrade", question.call_args.args[2])
+            send.assert_not_called()
+
+    def test_legacy_source_missing_library_is_inline_and_upgrade_warning_is_confirmed(self):
+        from test_serato3 import make_serato3_library
+        self.window.source_format.setCurrentIndex(self.window.source_format.findData("serato3"))
+        self.assertIn("No existing library", self.window.library_status.text())
+        self.assertEqual(self.errors, [])
+        legacy = make_serato3_library(self.base / "legacy")
+        from crate_transfer.serato3 import Serato3Library, crate_bytes
+        media = self.base / "legacy.mp3"
+        media.write_bytes(b"synthetic legacy source")
+        library = Serato3Library(legacy)
+        (legacy / "Subcrates/Test.crate").write_bytes(crate_bytes([media.relative_to(library.volume).as_posix()]))
+        self.window.source_path.setText(str(legacy))
+        self.load()
+        self.window.all_items()[0].setCheckState(0, Qt.CheckState.Checked)
+        self.window.destination_format.setCurrentIndex(self.window.destination_format.findData("serato"))
+        with patch("crate_transfer.ui.QMessageBox.question", return_value=QMessageBox.StandardButton.No) as question:
+            self.window.export_portable()
+            self.assertIn("Version upgrade", question.call_args.args[2])
+            self.assertIn("not an in-place library upgrade", question.call_args.args[2])
+        self.assertEqual(self.errors, [])
+
+    def test_mixxx_source_can_be_selected_without_probing_it_on_startup(self):
+        index = self.window.source_format.findData("mixxx")
+        self.assertGreaterEqual(index, 0)
+        self.window.source_format.setCurrentIndex(index)
+        self.assertIn("No existing library", self.window.library_status.text())
+        self.assertIn("Close Mixxx", self.window.source_hint.text())
+        self.assertEqual(self.errors, [])
+        for index in range(self.window.destination_format.count()):
+            if "Dual-format USB" in self.window.destination_format.itemText(index):
+                self.assertFalse(self.window.destination_format.model().item(index).isEnabled())
+                break
+        else:
+            self.fail("Dual-format USB must be explicitly represented as unavailable")
 
     def test_activity_surfaces_completion_backup_and_failure_without_auto_retry(self):
         self.window.agent.job("a" * 32, direction="receive", peer="Sender", status="complete",
