@@ -11,11 +11,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from crate_transfer.agent import Agent, Client, TransferError, check_transfer, pair_computer, recover_receipt, send_crates
+from crate_transfer.agent import Agent, Client, TransferError, check_transfer, export_local, pair_computer, recover_receipt, send_crates
 from crate_transfer.config import Settings, atomic_json
 from crate_transfer.identity import client_context
 from crate_transfer.library import LibraryError, portable_path
-from crate_transfer.protocol import ProtocolError
+from crate_transfer.protocol import PROTOCOL, ProtocolError
 from support import create_aggregate_database, create_root_database, file_record, make_library, root_snapshot, valid_manifest
 
 
@@ -41,6 +41,20 @@ class AgentTests(unittest.TestCase):
     def make_manifest(self, content=b"ID3\x00synthetic-track"):
         record = file_record("track.mp3", content)
         return valid_manifest([record]), record, content
+
+    def test_agent_runs_without_dj_libraries_and_advertises_only_configured_destinations(self):
+        settings = Settings(self.base / "standalone-settings")
+        settings.update(library=str(self.base / "no-serato"), portable_receive=False)
+        agent = Agent(settings)
+        port = agent.start("127.0.0.1", 0)
+        self.addCleanup(agent.stop)
+        client = Client("127.0.0.1", port, agent.fingerprint)
+        self.assertEqual(client.request("GET", "/api/info")["destinations"], [])
+        settings.update(portable_receive=True)
+        self.assertEqual(client.request("GET", "/api/info")["destinations"],
+                         ["m3u", "rekordbox-xml", "traktor-nml"])
+        self.assertIsNone(agent.session)
+        self.assertFalse(Path(settings.snapshot()["library"]).exists())
 
     def test_damaged_history_is_preserved_and_startup_recovers_without_touching_user_data(self):
         for index, damaged in enumerate((
@@ -127,12 +141,12 @@ class AgentTests(unittest.TestCase):
         code = agent.pairing()
         for _ in range(5):
             with self.assertRaisesRegex(ProtocolError, "Incorrect pairing code"):
-                agent.pair({"code": "wrong", "id": PEER_ID, "name": "Peer"})
+                agent.pair({"protocol": PROTOCOL, "code": "wrong", "id": PEER_ID, "name": "Peer"})
         with self.assertRaisesRegex(ProtocolError, "Pairing is closed"):
-            agent.pair({"code": code, "id": PEER_ID, "name": "Peer"})
+            agent.pair({"protocol": PROTOCOL, "code": code, "id": PEER_ID, "name": "Peer"})
 
         code = agent.pairing()
-        result = agent.pair({"code": code, "id": PEER_ID, "name": "Peer"})
+        result = agent.pair({"protocol": PROTOCOL, "code": code, "id": PEER_ID, "name": "Peer"})
         saved = Settings(settings.directory)
         trusted = saved.snapshot()["trusted"][PEER_ID]
         self.assertEqual(trusted["name"], "Peer")
@@ -147,7 +161,7 @@ class AgentTests(unittest.TestCase):
         with patch("crate_transfer.agent.time.monotonic", return_value=100.0):
             agent.pair_until = 99.0
             with self.assertRaisesRegex(ProtocolError, "Pairing is closed"):
-                agent.pair({"code": "000000", "id": PEER_ID, "name": "Peer"})
+                agent.pair({"protocol": PROTOCOL, "code": "000000", "id": PEER_ID, "name": "Peer"})
 
     def test_begin_rejects_sender_mismatch_running_guard_and_busy_receiver(self):
         manifest, _, _ = self.make_manifest()
@@ -212,17 +226,17 @@ class AgentTests(unittest.TestCase):
         agent, settings, library, _ = self.make_receiver()
         manifest, record, _ = self.make_manifest()
         peer = manifest["sender_id"]
-        paired = agent.pair({"id": peer, "name": "Sender", "code": agent.pairing()})
+        paired = agent.pair({"protocol": PROTOCOL, "id": peer, "name": "Sender", "code": agent.pairing()})
         session_id = agent.begin(manifest, peer)["id"]
         before = root_snapshot(library / "root.sqlite")
         port = agent.start("127.0.0.1", 0)
         self.addCleanup(agent.stop)
         client = Client("127.0.0.1", port, agent.fingerprint, "unpaired-token")
         for method, path in (
-            ("POST", "/v1/transfers"),
-            ("PUT", f"/v1/transfers/{session_id}/files/{record['id']}"),
-            ("POST", f"/v1/transfers/{session_id}/finish"),
-            ("DELETE", f"/v1/transfers/{session_id}"),
+            ("POST", "/api/transfers"),
+            ("PUT", f"/api/transfers/{session_id}/files/{record['id']}"),
+            ("POST", f"/api/transfers/{session_id}/finish"),
+            ("DELETE", f"/api/transfers/{session_id}"),
         ):
             with self.subTest(action=method, endpoint=path):
                 with self.assertRaisesRegex(TransferError, "not paired"):
@@ -233,7 +247,7 @@ class AgentTests(unittest.TestCase):
         settings.update(trusted={})
         client.token = paired["token"]
         with self.assertRaisesRegex(TransferError, "revoked"):
-            client.request("POST", f"/v1/transfers/{session_id}/finish")
+            client.request("POST", f"/api/transfers/{session_id}/finish")
         self.assertEqual(root_snapshot(library / "root.sqlite"), before)
         agent.cancel(session_id, peer)
 
@@ -272,6 +286,141 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(second_result, result)
         self.assertEqual(sum(job["status"] == "complete" for job in agent.history()), 1)
 
+    def test_portable_receiver_requires_opt_in_and_exports_without_a_serato_library(self):
+        settings = Settings(self.base / "portable-settings")
+        exports = self.base / "USB"
+        exports.mkdir()
+        settings.update(exports=str(exports), library=str(self.base / "absent-library"))
+        def guard():
+            raise LibraryError("Serato is running")
+        agent = Agent(settings, guard=guard)
+        manifest, record, content = self.make_manifest()
+        manifest.update(destination={"format": "m3u"})
+        peer = manifest["sender_id"]
+        with self.assertRaisesRegex(TransferError, "disabled"):
+            agent.begin(manifest, peer)
+        self.assertEqual(list(exports.iterdir()), [])
+        settings.update(portable_receive=True)
+        session_id = agent.begin(manifest, peer)["id"]
+        staging = agent.session["staging"]
+        agent.upload(session_id, record["id"], peer, len(content), io.BytesIO(content))
+        result = agent.finish(session_id, peer)
+        self.assertEqual(result["format"], "m3u")
+        bundle = Path(result["output"])
+        playlist = bundle / "Playlists/Set/playlist.m3u8"
+        entry = playlist.read_text().splitlines()[1]
+        self.assertEqual((playlist.parent / entry).read_bytes(), content)
+        self.assertEqual(agent.finish(session_id, peer), result)
+        self.assertFalse(staging.exists())
+        self.assertIsNone(agent.session)
+        self.assertFalse((settings.directory / "backups").exists())
+        self.assertFalse((self.base / "absent-library").exists())
+
+    def test_local_export_records_receipt_and_never_changes_source_library(self):
+        folder = self.base / "local-source"
+        make_library(folder, {"Music/a.mp3": b"audio"}, [
+            {"id": 10, "name": "House", "tracks": [1]},
+        ], {1: "Music/a.mp3"})
+        settings = Settings(self.base / "local-settings")
+        settings.update(library=str(folder))
+        agent = Agent(settings, guard=lambda: None)
+        output = self.base / "local-export"
+        output.mkdir()
+        before = {name: (folder / name).read_bytes() for name in ("root.sqlite", "master.sqlite")}
+        result = export_local(agent, [10], output)
+        self.assertEqual(agent.history()[0]["result"], result)
+        self.assertEqual(agent.history()[0]["direction"], "export")
+        self.assertEqual(agent.history()[0]["status"], "complete")
+        self.assertIn("not OneLibrary", agent.history()[0]["detail"])
+        for name, data in before.items():
+            self.assertEqual((folder / name).read_bytes(), data)
+
+    def test_paired_network_portable_export_negotiates_destination_and_verifies_files(self):
+        receiver, receiver_settings, library, _ = self.make_receiver(prefix="portable-network")
+        output = self.base / "remote-export"
+        output.mkdir()
+        receiver_settings.update(exports=str(output), portable_receive=True)
+        before = root_snapshot(library / "root.sqlite")
+        port = receiver.start("127.0.0.1", 0)
+        self.addCleanup(receiver.stop)
+        folder = self.base / "network-source"
+        make_library(folder, {"Music/network.mp3": b"network media"}, [
+            {"id": 10, "name": "Network", "tracks": [1]},
+        ], {1: "Music/network.mp3"})
+        settings = Settings(self.base / "network-settings")
+        settings.update(library=str(folder))
+        sender = Agent(settings, guard=lambda: None)
+        sender_port = sender.start("127.0.0.1", 0)
+        self.addCleanup(sender.stop)
+        settings.update(port=sender_port)
+        pair_computer(settings, "127.0.0.1", port, None, receiver.pairing())
+        peer_id = receiver_settings.snapshot()["id"]
+        result = send_crates(sender, [10], peer_id, destination="m3u")
+        self.assertEqual(result["format"], "m3u")
+        self.assertEqual(sender.history()[0]["status"], "complete")
+        self.assertEqual(receiver.history()[0]["status"], "complete")
+        self.assertEqual(receiver.history()[0]["result"], result)
+        self.assertIn("Export created", sender.history()[0]["detail"])
+        self.assertEqual(root_snapshot(library / "root.sqlite"), before)
+        playlist = Path(result["output"]) / "Playlists/Network/playlist.m3u8"
+        self.assertEqual((playlist.parent / playlist.read_text().splitlines()[1]).read_bytes(),
+                         b"network media")
+
+    def test_legacy_or_disabled_receiver_is_rejected_before_any_upload_for_portable_export(self):
+        agent, settings, _, _ = self.make_receiver()
+        settings.update(peers={PEER_ID: {"name": "Older", "host": "127.0.0.1", "port": 49783,
+                                        "fingerprint": "a" * 64, "token": "token"}})
+        for info in ({"version": 1}, {"protocol": PROTOCOL, "id": PEER_ID, "destinations": ["serato"]}):
+            with self.subTest(info=info), patch.object(Client, "request", return_value=info) as request:
+                with self.assertRaisesRegex(TransferError, "Incompatible receiver|enabled this destination"):
+                    send_crates(agent, [1], PEER_ID, destination="m3u")
+                request.assert_called_once_with("GET", "/api/info")
+                self.assertEqual(agent.history()[0]["status"], "failed")
+
+    def test_serato_send_also_requires_the_unified_receiver_before_reading_or_uploading(self):
+        agent, settings, _, _ = self.make_receiver()
+        settings.update(peers={PEER_ID: {"name": "Legacy", "host": "127.0.0.1", "port": 49783,
+                                        "fingerprint": "a" * 64, "token": "token"}})
+        with patch.object(Client, "request", return_value={"version": 1}) as request, \
+                patch("crate_transfer.agent.source_library") as source:
+            with self.assertRaisesRegex(TransferError, "Update Crate Transfer on both"):
+                send_crates(agent, [10], PEER_ID, destination="serato")
+            source.assert_not_called()
+            request.assert_called_once_with("GET", "/api/info")
+        with patch.object(Client, "request", return_value={
+            "protocol": PROTOCOL, "id": OTHER_ID, "destinations": ["serato"],
+        }) as request:
+            with self.assertRaisesRegex(TransferError, "identity differs"):
+                send_crates(agent, [10], PEER_ID)
+            request.assert_called_once_with("GET", "/api/info")
+
+    def test_legacy_receive_manifest_is_rejected_before_creating_staging(self):
+        agent, _, library, music = self.make_receiver()
+        before = root_snapshot(library / "root.sqlite")
+        manifest = valid_manifest()
+        manifest.pop("protocol")
+        manifest["version"] = 1
+        with self.assertRaisesRegex(ProtocolError, "Incompatible transfer"):
+            agent.begin(manifest, manifest["sender_id"])
+        self.assertIsNone(agent.session)
+        self.assertFalse(music.exists())
+        self.assertEqual(root_snapshot(library / "root.sqlite"), before)
+
+    def test_interrupted_portable_staging_is_removed_on_restart_from_configured_export_folder(self):
+        settings = Settings(self.base / "portable-restart")
+        exports = self.base / "exports-restart"
+        settings.update(exports=str(exports))
+        job_id = "a" * 32
+        staging = exports / ".crate-transfer-incoming" / job_id
+        staging.mkdir(parents=True)
+        (staging / "partial").write_bytes(b"partial")
+        atomic_json(settings.directory / "transfers.json", [
+            {"id": job_id, "status": "receiving", "format": "m3u", "created": 1},
+        ])
+        recovered = Agent(settings, guard=lambda: None)
+        self.assertFalse(staging.exists())
+        self.assertEqual(recovered.history()[0]["status"], "failed")
+
     def test_receipt_recovery_polls_transient_disconnect_without_resending_import(self):
         client = Client("127.0.0.1", 49783, "a" * 64, "token")
         receipt = {"crates": 1, "files": 25}
@@ -282,7 +431,7 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(recover_receipt(client, "transfer"), receipt)
         self.assertEqual(request.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
-        self.assertTrue(all(call.args == ("GET", "/v1/transfers/transfer") for call in request.call_args_list))
+        self.assertTrue(all(call.args == ("GET", "/api/transfers/transfer") for call in request.call_args_list))
 
     def test_receipt_recovery_timeout_and_remote_failure_are_not_success(self):
         client = Client("127.0.0.1", 49783, "a" * 64)
@@ -302,14 +451,14 @@ class AgentTests(unittest.TestCase):
         with patch("crate_transfer.agent.Client.request",
                    return_value={"status": "complete", "result": {"crates": 1}}) as request:
             self.assertEqual(check_transfer(agent, "job"), {"crates": 1})
-        request.assert_called_once_with("GET", "/v1/transfers/remote", timeout=10)
+        request.assert_called_once_with("GET", "/api/transfers/remote", timeout=10)
         self.assertEqual(agent.history()[0]["status"], "complete")
         self.assertIn("No files were resent", agent.history()[0]["detail"])
 
     def test_transfer_status_requires_owner_and_survives_restart(self):
         agent, settings, _, _ = self.make_receiver()
-        first = agent.pair({"code": agent.pairing(), "id": PEER_ID, "name": "First"})["token"]
-        second = agent.pair({"code": agent.pairing(), "id": OTHER_ID, "name": "Second"})["token"]
+        first = agent.pair({"protocol": PROTOCOL, "code": agent.pairing(), "id": PEER_ID, "name": "First"})["token"]
+        second = agent.pair({"protocol": PROTOCOL, "code": agent.pairing(), "id": OTHER_ID, "name": "Second"})["token"]
         manifest, record, content = self.make_manifest()
         manifest["sender_id"] = PEER_ID
         session = agent.begin(manifest, PEER_ID)["id"]
@@ -319,9 +468,9 @@ class AgentTests(unittest.TestCase):
         port = restarted.start("127.0.0.1", 0)
         self.addCleanup(restarted.stop)
         self.assertEqual(Client("127.0.0.1", port, agent.fingerprint, first).request(
-            "GET", f"/v1/transfers/{session}")["result"], receipt)
+            "GET", f"/api/transfers/{session}")["result"], receipt)
         with self.assertRaisesRegex(TransferError, "Unknown transfer"):
-            Client("127.0.0.1", port, agent.fingerprint, second).request("GET", f"/v1/transfers/{session}")
+            Client("127.0.0.1", port, agent.fingerprint, second).request("GET", f"/api/transfers/{session}")
 
     def test_empty_crate_imports_without_sending_any_files(self):
         agent, _, library, _ = self.make_receiver()
@@ -489,7 +638,7 @@ class AgentTests(unittest.TestCase):
             port = receiver.start("127.0.0.1", 0)
             self.addCleanup(receiver.stop)
             client.port = port
-            client.request("POST", "/v1/pair", {"id": PEER_ID, "name": "Peer", "code": code})
+            client.request("POST", "/api/pair", {"id": PEER_ID, "name": "Peer", "code": code})
         self.assertEqual(receiver.pair_attempts, 0)
         self.assertEqual(receiver.pair_code, code)
 
@@ -567,14 +716,14 @@ class AgentTests(unittest.TestCase):
             peer = sender.settings.snapshot()["peers"][receiver_id]
             with self.assertRaisesRegex(TransferError, "not paired"):
                 Client(peer["host"], peer["port"], peer["fingerprint"], peer["token"]).request(
-                    "POST", "/v1/transfers", {})
+                    "POST", "/api/transfers", {})
 
     def test_older_receiver_requires_update_before_pairing_code_is_sent(self):
         settings = Settings(self.base / "sender-settings")
         with patch("crate_transfer.agent.Client.request", return_value={"version": 1}) as request:
             with self.assertRaisesRegex(TransferError, "Update Crate Transfer"):
                 pair_computer(settings, "127.0.0.1", 49783, "a" * 64, "123456")
-        request.assert_called_once_with("GET", "/v1/info")
+        request.assert_called_once_with("GET", "/api/info")
         self.assertEqual(settings.snapshot()["peers"], {})
         self.assertEqual(settings.snapshot()["trusted"], {})
 
@@ -632,7 +781,7 @@ class AgentTests(unittest.TestCase):
 
         remote_id = sender_job["remote_id"]
         repeat = Client("127.0.0.1", port, peer["fingerprint"], peer["token"]).request(
-            "POST", "/v1/transfers/%s/finish" % remote_id
+            "POST", "/api/transfers/%s/finish" % remote_id
         )
         self.assertEqual(repeat, receipt)
 

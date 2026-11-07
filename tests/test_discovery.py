@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 from zeroconf import IPVersion
 
 from crate_transfer.discovery import Discovery, SERVICE, preferred_address
+from crate_transfer.protocol import PROTOCOL
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class DiscoveryTests(unittest.TestCase):
         own = {"id": "11111111-1111-4111-8111-111111111111", "name": "This Mac"}
         remote_id = "22222222-2222-4222-8222-222222222222"
         info = Mock()
-        info.properties = {b"id": remote_id.encode(), b"name": b"Other Mac", b"fingerprint": b"a" * 64, b"version": b"1"}
+        info.properties = {b"id": remote_id.encode(), b"name": b"Other Mac", b"fingerprint": b"a" * 64, b"protocol": PROTOCOL.encode()}
         info.parsed_addresses.return_value = ["192.168.1.8"]
         info.port = 49783
         changed = Mock()
@@ -35,6 +36,11 @@ class DiscoveryTests(unittest.TestCase):
             }])
             info.parsed_addresses.assert_called_with(IPVersion.V4Only)
             changed.assert_called_once()
+            info.properties[b"protocol"] = b"legacy"
+            discovery.update_service(zeroconf.return_value, SERVICE, "legacy")
+            self.assertEqual(len(discovery.snapshot()), 1)
+            self.assertEqual(changed.call_count, 1)
+            info.properties[b"protocol"] = PROTOCOL.encode()
             info.properties[b"fingerprint"] = b"invalid"
             discovery.update_service(zeroconf.return_value, SERVICE, "malformed")
             self.assertEqual(len(discovery.snapshot()), 1)
