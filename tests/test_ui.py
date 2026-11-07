@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
 from PySide6.QtGui import QColor, QContextMenuEvent, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QPushButton, QScrollArea
@@ -266,24 +266,38 @@ class DesktopTests(unittest.TestCase):
         self.app.clipboard().setText("old clipboard")
         observations = {}
 
-        def click_copy():
-            menu = QApplication.activePopupWidget()
-            observations["menu"] = isinstance(menu, QMenu)
-            if not isinstance(menu, QMenu):
-                return
+        def click_copy(menu):
             image = menu.grab().toImage()
             observations["background"] = image.pixelColor(2, 2)
             copy_action = next(action for action in menu.actions()
                                if action.text().replace("&", "").split("\t")[0] == "Copy")
             observations["enabled"] = copy_action.isEnabled()
             QTest.mouseClick(menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(copy_action).center())
+            observations["copied"] = True
 
-        QTimer.singleShot(100, click_copy)
-        local = QPoint(15, field.height() // 2)
-        event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, local, field.mapToGlobal(local))
-        self.app.sendEvent(field, event)
-        QTest.qWait(150)
-        self.assertTrue(observations["menu"])
+        class MenuObserver(QObject):
+            def eventFilter(self, watched, event):
+                if isinstance(watched, QMenu) and event.type() == QEvent.Type.Show:
+                    observations["menu"] = True
+                    QTimer.singleShot(0, lambda: click_copy(watched))
+                return False
+
+        observer = MenuObserver()
+        self.app.installEventFilter(observer)
+        try:
+            local = QPoint(15, field.height() // 2)
+            event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, local, field.mapToGlobal(local))
+            self.app.sendEvent(field, event)
+            until = time.monotonic() + 5
+            while not observations.get("copied") and time.monotonic() < until:
+                QTest.qWait(10)
+            self.assertIn("menu", observations, "Path context menu did not become visible")
+            self.assertTrue(observations.get("copied"), "Context-menu Copy action did not complete")
+        finally:
+            self.app.removeEventFilter(observer)
+            popup = QApplication.activePopupWidget()
+            if isinstance(popup, QMenu):
+                popup.close()
         self.assertTrue(observations["enabled"])
         self.assertEqual(observations["background"], QColor("#1e2631"))
         self.assertEqual(self.app.clipboard().text(), selected)
