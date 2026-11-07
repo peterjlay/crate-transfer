@@ -286,7 +286,8 @@ class DjayTests(unittest.TestCase):
             db.execute("UPDATE database2 SET data=? WHERE collection='localMediaItemLocations'", (encode(location),))
             db.commit()
         before = self.rows()
-        with self.assertRaisesRegex(LibraryError, "Conflicting"):
+        message = "cannot be mapped" if os.name == "nt" else "Conflicting"
+        with self.assertRaisesRegex(LibraryError, message):
             self.import_library(name="backup-2")
         self.assertEqual(self.rows(), before)
 

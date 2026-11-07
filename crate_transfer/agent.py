@@ -472,6 +472,30 @@ class Handler(BaseHTTPRequestHandler):
             raise ProtocolError("Incomplete JSON request.")
         return json.loads(raw)
 
+    def discard_rejected_body(self):
+        raw = self.headers.get("Content-Length", "")
+        if self.headers.get("Transfer-Encoding") or not raw.isdigit() or int(raw) > MAX_JSON:
+            return
+        remaining = int(raw)
+        timeout = self.connection.gettimeout()
+        deadline = time.monotonic() + 1
+        try:
+            while remaining:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    LOG.warning("Rejected request body drain exceeded its deadline.")
+                    break
+                self.connection.settimeout(wait)
+                chunk = self.rfile.read1(min(65536, remaining))
+                if not chunk:
+                    LOG.warning("Rejected request had an incomplete body.")
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            LOG.warning("Could not drain rejected request body before closing.", exc_info=True)
+        finally:
+            self.connection.settimeout(timeout)
+
     def dispatch(self):
         agent = self.server.agent
         if self.command == "GET" and self.path == "/api/info":
@@ -490,7 +514,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "POST" and self.path == "/api/pair":
             return agent.pair(self.read_json(), self.client_address[0])
         authorization = self.headers.get("Authorization", "")
-        peer = agent.authorize(authorization.removeprefix("Bearer "))
+        try:
+            peer = agent.authorize(authorization.removeprefix("Bearer "))
+        except PermissionError:
+            # Unread TLS request data can reset Windows sockets and hide the 403.
+            self.discard_rejected_body()
+            raise
         parts = self.path.strip("/").split("/")
         if self.command == "POST" and parts == ["api", "transfers"]:
             return agent.begin(self.read_json(), peer)
