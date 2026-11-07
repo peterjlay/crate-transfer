@@ -5,6 +5,16 @@ transferring selected DJ crates/playlists and their music**, locally or over
 your LAN. Choose a source, selected playlists, and a destination format.
 No cloud, accounts, folder watching, mirroring, or automatic synchronization.
 
+## v0.2.0
+
+This release expands Crate Transfer to all seven DJ apps listed below, with
+independent source-library selection, local conversion, paired LAN transfers,
+Serato DJ 3/4 compatibility warnings and neutral vinyl branding. Native-adapter
+preview warnings remain: verify received tracks in the destination DJ app.
+Both computers must run v0.2.0 for network transfers; the older Serato-only
+transfer protocol is no longer supported. OneLibrary and dual-format USB
+exports are not available.
+
 ## Supported sources and destinations
 
 | Format / app | Read source | Local / network output | Automatic native integration |
