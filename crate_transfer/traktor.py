@@ -2,7 +2,7 @@
 
 References: digital-dj-tools/dj-data-converter traktor/cue.clj and
 OpenFadeR compatibility/traktor (NML playlists and primary keys).
-Native application acceptance has not been tested.
+Smart playlist example: github.com/lord-carlos/traktor-2-playlist/blob/33ae196b4be546316cb9005de6af7519b4c78211/example/collection.nml.
 """
 from __future__ import annotations
 
@@ -230,21 +230,23 @@ def _tree(root):
         keys.add(key)
     def visit(parent):
         for node in parent.findall("NODE"):
-            if not node.get("NAME") or node.get("TYPE") not in ("PLAYLIST", "FOLDER"):
-                raise LibraryError("Unsupported Traktor playlist node.")
+            kind = node.get("TYPE")
+            if not node.get("NAME") or kind not in ("PLAYLIST", "FOLDER", "SMARTLIST"):
+                raise LibraryError(f"Unsupported Traktor playlist node (TYPE={kind!r}, "
+                                   f"NAME={'present' if node.get('NAME') else 'missing'}).")
             ident = node.get("UUID")
-            if node.get("TYPE") == "PLAYLIST" and node.find("PLAYLIST") is not None:
-                ident = node.find("PLAYLIST").get("UUID", ident)
+            if kind in ("PLAYLIST", "SMARTLIST") and node.find(kind) is not None:
+                ident = node.find(kind).get("UUID", ident)
             if ident:
                 if ident in uuids:
                     raise LibraryError("Duplicate Traktor playlist UUID.")
                 uuids.add(ident)
-            if node.get("TYPE") == "FOLDER":
+            if kind == "FOLDER":
                 child = node.find("SUBNODES")
                 if child is None:
                     raise LibraryError("Traktor folder has no SUBNODES.")
                 visit(child)
-            else:
+            elif kind == "PLAYLIST":
                 playlist = node.find("PLAYLIST")
                 if playlist is None:
                     raise LibraryError("Traktor playlist has no PLAYLIST.")
@@ -252,6 +254,8 @@ def _tree(root):
                     ref = member.find("PRIMARYKEY")
                     if ref is None or ref.get("TYPE") != "TRACK" or ref.get("KEY") not in keys:
                         raise LibraryError("Traktor playlist has an unknown track reference.")
+            elif node.find("SMARTLIST") is None:
+                raise LibraryError("Traktor smart playlist has no SMARTLIST.")
     visit(subnodes)
     return collection, subnodes
 
@@ -330,6 +334,8 @@ class TraktorLibrary(ExchangeLibrary):
                 parts = prefix + [node.get("NAME")]
                 if node.get("TYPE") == "FOLDER":
                     visit(node.find("SUBNODES"), parts)
+                elif node.get("TYPE") == "SMARTLIST":
+                    self.warnings.append("Traktor smart playlists were omitted; their rules are not converted.")
                 else:
                     members = [e.find("PRIMARYKEY").get("KEY") for e in node.find("PLAYLIST").findall("ENTRY")]
                     self._playlists.append({"path": parts, "members": members, "tracks": tracks})
@@ -362,7 +368,9 @@ class TraktorLibrary(ExchangeLibrary):
         collection, top = _tree(root)
         existing = {_traktor_key(e.find("LOCATION")) for e in collection.findall("ENTRY")}
         keys, warnings = {}, list(manifest.get("warnings", []))
-        warnings.append("Traktor native import is unverified in the application; analysis and waveforms are not generated.")
+        warnings.append("Traktor analysis and waveforms are not generated; verify received tracks in Traktor.")
+        if top.findall(".//NODE[@TYPE='SMARTLIST']"):
+            warnings.append("Existing Traktor smart playlists were preserved; their rules were not converted.")
         root_volume = None
         for key, record in records.items():
             volume, folder, filename = _location(paths[key], root_volume)

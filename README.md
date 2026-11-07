@@ -5,13 +5,13 @@ transferring selected DJ crates/playlists and their music**, locally or over
 your LAN. Choose a source, selected playlists, and a destination format.
 No cloud, accounts, folder watching, mirroring, or automatic synchronization.
 
-## v0.2.0
+## v0.2.1
 
 This release expands Crate Transfer to all seven DJ apps listed below, with
 independent source-library selection, local conversion, paired LAN transfers,
 Serato DJ 3/4 compatibility warnings and neutral vinyl branding. Native-adapter
-preview warnings remain: verify received tracks in the destination DJ app.
-Both computers must run v0.2.0 for network transfers; the older Serato-only
+preview warnings remain for some adapters: verify received tracks in the destination DJ app.
+Both computers must run v0.2.0 or later for network transfers; the older Serato-only
 transfer protocol is no longer supported. OneLibrary and dual-format USB
 exports are not available.
 
@@ -21,8 +21,8 @@ exports are not available.
 |---|---|---|---|
 | Serato DJ 4+ | Native SQLite library; includes received root-only crates | Native Serato import, with backups | Yes; supported SQLite schemas |
 | Serato DJ 3 | Legacy `_Serato_/Subcrates` + optional database V2 basic tags | Additive native `.crate` files + media | Preview; DJ 3 reloads/scans media |
-| rekordbox | Native 6/7 master.db or exported XML | Additive native playlists/media via bundled SDK; XML exchange also available | Runtime/schema-gated preview |
-| Traktor | Native collection.nml or exported NML | Additive native collection playlists/media; NML exchange also available | NML 19/20 preview |
+| rekordbox | Native 6/7 master.db or exported XML | Additive native playlists/media via bundled SDK; XML exchange also available | Yes; runtime/schema-gated |
+| Traktor | Native collection.nml or exported NML | Additive native collection playlists/media; NML exchange also available | Yes; NML 19/20 |
 | Generic M3U / M3U8 | Playlist file or folder, including VirtualDJ exports | M3U8 playlists + media | No |
 | Mixxx | Native SQLite playlists/crates, basic tags | Additive native playlists + media | Schema-gated preview |
 | Engine DJ | Database2 local playlists/tracks | Additive native playlists + unanalysed media | Database2 3.0.1/3.0.2 preview |
@@ -31,10 +31,12 @@ exports are not available.
 | OneLibrary USB | Not implemented | Disabled | No compatible device export |
 | Dual-format USB | OneLibrary + legacy Device Library requested | Not implemented | Requires both player databases and analysis assets |
 
-All seven DJ apps have native source and destination adapters; previews are
-**not a promise of lossless conversion or native-app playback validation**.
-Validation uses public format references, synthetic libraries, the real
-rekordbox SDK, and local/paired-network round trips—not your DJ libraries.
+All seven DJ apps have native source and destination adapters. Preview status
+remains for adapters other than Serato DJ 4+, rekordbox and Traktor. No adapter
+promises lossless conversion or compatibility with every library and app version.
+Validation includes public format references, synthetic libraries, the
+rekordbox SDK, local/paired-network round trips, and user testing of Serato
+on Windows to rekordbox on macOS Apple Silicon and Traktor.
 OneLibrary and dual-format USB remain unavailable: compatible databases and
 analysis assets are required, and renaming an M3U bundle is not a device export.
 
@@ -291,7 +293,9 @@ encrypted SQL. The complete SDK schema and `masterPlaylists6.xml` must exist.
 Original database, journal sidecars and playlist XML are backed up; failed
 multi-file commits are restored only when the application and SDK are closed.
 
-Configure **rekordbox destination** and enable its native reception switch.
+On macOS, **rekordbox destination** is pre-populated with the current user's
+`~/Library/Pioneer/rekordbox` folder unless a destination has already been saved.
+Check the path, save it and enable its native reception switch.
 Title/artist/album/BPM and existing matching keys are mapped. New tracks require
 rekordbox analysis; cues, loops, grids, waveforms and smart rules are not converted.
 Unsupported media/runtime/schema combinations fail with actionable errors.
@@ -300,9 +304,15 @@ XML exchange remains available and requires manual import.
 ### Traktor
 
 Native source and destination support `collection.nml` versions 19/20.
+If no Traktor destination has been saved, Settings suggests the existing
+`collection.nml` in the highest-versioned `Documents/Native Instruments/Traktor *`
+folder. Check that it is the collection used by your Traktor installation, or
+browse to another one. Native reception remains opt-in.
 Imports register new destination-local media and append hierarchical ordered
 playlists without replacing existing playlists. The original collection is
 backed up; staged XML is validated before replacement.
+Existing smart playlists are preserved on native import, but their rules are not
+converted and smart playlists are omitted from native source exports.
 Basic tags/BPM and eight hotcue/loop slots are mapped, with positions converted
 to native milliseconds. Key/grid/analysis data is omitted with warnings.
 Separate NML exchange exports are also available.

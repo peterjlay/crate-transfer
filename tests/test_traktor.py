@@ -120,6 +120,38 @@ class TraktorTests(unittest.TestCase):
             self.run_import()
         self.assertFalse((self.base / "backup").exists())
 
+    def test_smart_playlists_are_preserved_on_import_and_omitted_from_source(self):
+        root = ET.parse(self.path).getroot()
+        top = root.find("./PLAYLISTS/NODE/SUBNODES")
+        folder = ET.SubElement(top, "NODE", TYPE="FOLDER", NAME="Existing")
+        children = ET.SubElement(folder, "SUBNODES", COUNT="1")
+        smart_node = ET.SubElement(children, "NODE", TYPE="SMARTLIST", NAME="Smart")
+        smart = ET.SubElement(smart_node, "SMARTLIST", UUID="smart-uuid")
+        ET.SubElement(smart, "SEARCH_EXPRESSION", VERSION="1", QUERY='$COMMENT % "EPIC"')
+        top.set("COUNT", "1")
+        ET.ElementTree(root).write(self.path, encoding="utf-8", xml_declaration=True)
+        original_smart = ET.tostring(smart_node)
+
+        self.assertEqual(self.library.crates(), [])
+        self.assertTrue(any("smart playlists were omitted" in warning for warning in self.library.warnings))
+        result = self.run_import()
+        self.assertTrue(any("smart playlists were preserved" in warning for warning in result["warnings"]))
+        updated = ET.parse(self.path).getroot()
+        self.assertEqual(ET.tostring(updated.find(".//NODE[@TYPE='SMARTLIST']")), original_smart)
+        self.assertEqual(self.library.crates()[0]["path"], ["Sets", "Night"])
+
+    def test_unsupported_node_and_malformed_smart_playlist_are_refused(self):
+        root = ET.parse(self.path).getroot()
+        top = root.find("./PLAYLISTS/NODE/SUBNODES")
+        node = ET.SubElement(top, "NODE", TYPE="UNKNOWN", NAME="Private name")
+        ET.ElementTree(root).write(self.path, encoding="utf-8", xml_declaration=True)
+        with self.assertRaisesRegex(LibraryError, "TYPE='UNKNOWN', NAME=present"):
+            self.library.validate_destination(self.media.parent)
+        node.set("TYPE", "SMARTLIST")
+        ET.ElementTree(root).write(self.path, encoding="utf-8", xml_declaration=True)
+        with self.assertRaisesRegex(LibraryError, "smart playlist has no SMARTLIST"):
+            self.library.validate_destination(self.media.parent)
+
     def test_running_traktor_is_refused(self):
         with patch("crate_transfer.traktor.psutil.process_iter",
                    return_value=[SimpleNamespace(info={"name": "Traktor Pro"})]):
