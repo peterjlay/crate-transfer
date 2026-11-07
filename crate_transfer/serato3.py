@@ -261,7 +261,7 @@ class Serato3Library(ExchangeLibrary):
             if sha256_file(target) != digest:
                 raise LibraryError("Serato DJ 3 backup verification failed.")
         from .config import atomic_json
-        atomic_json(backup_dir / "created-crates.json", [str(path.relative_to(self.directory)) for path in outputs])
+        atomic_json(backup_dir / "created-crates.json", [path.relative_to(self.directory).as_posix() for path in outputs])
         staged, published = [], []
         try:
             for index, (path, data) in enumerate(outputs.items()):

@@ -1,7 +1,7 @@
 import tempfile
 import sqlite3
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +14,29 @@ from support import file_record, make_library, root_snapshot, valid_manifest
 
 
 class ConversionTests(unittest.TestCase):
+    def test_synthetic_native_database_builders_release_sqlite_handles(self):
+        from test_mixxx import make_mixxx_library
+        from test_engine import make_engine_database
+        from test_rekordbox import make_rekordbox_library
+        connect = sqlite3.connect
+        connections = []
+        def track_connection(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connections.append(connection)
+            return connection
+        with patch("sqlite3.connect", side_effect=track_connection):
+            mixxx = make_mixxx_library(self.base / "closed-mixxx")
+            engine = make_engine_database(self.base / "closed-engine/Database2/m.db")
+            rekordbox = make_rekordbox_library(self.base / "closed-rekordbox")
+        self.assertEqual(len(connections), 3)
+        for connection in connections:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+        for path, table, count in ((mixxx, "library", 0), (engine, "Information", 1),
+                                   (rekordbox, "djmdContent", 1)):
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0], count)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)
@@ -186,7 +209,7 @@ class ConversionTests(unittest.TestCase):
             receiver.settings.update(native_receive={"mixxx": True})
             result = send_crates(sender, self.selected(), receiver.settings.snapshot()["id"], destination="mixxx")
             self.assertEqual((result["format"], result["memberships"]), ("mixxx", 2))
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 received = Path(db.execute("SELECT location FROM track_locations").fetchone()[0])
             self.assertTrue(received.is_relative_to(Path(receiver.settings.snapshot()["music"]).resolve()))
             self.assertEqual(received.read_bytes(), self.media.read_bytes())
@@ -318,7 +341,7 @@ class ConversionTests(unittest.TestCase):
         from crate_transfer.djay import DjayLibrary
         agent, database = self.djay_agent("local-djay")
         before = database.read_bytes()
-        with sqlite3.connect(database) as source:
+        with closing(sqlite3.connect(database)) as source, source:
             before_rows = source.execute("SELECT * FROM database2 ORDER BY rowid").fetchall()
             before_indexes = source.execute("SELECT * FROM yap2 ORDER BY extension,key").fetchall()
         with patch("crate_transfer.djay.assert_djay_closed"):
@@ -327,7 +350,7 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(result["memberships"], 2)
             self.assertNotEqual(database.read_bytes(), before)
             self.assertTrue(any("playback" in warning for warning in result["warnings"]))
-            with sqlite3.connect(Path(result["backup"]) / "MediaLibrary.db") as backup:
+            with closing(sqlite3.connect(Path(result["backup"]) / "MediaLibrary.db")) as backup, backup:
                 self.assertEqual(backup.execute("SELECT * FROM database2 ORDER BY rowid").fetchall(), before_rows)
                 self.assertEqual(backup.execute("SELECT * FROM yap2 ORDER BY extension,key").fetchall(), before_indexes)
                 self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")

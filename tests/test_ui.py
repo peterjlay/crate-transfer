@@ -59,10 +59,19 @@ class DesktopTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def wait_for_tasks(self):
-        until = time.monotonic() + 5
+        # Real file fsyncs on hosted macOS runners can exceed five seconds.
+        until = time.monotonic() + 30
         while self.window.active_tasks and time.monotonic() < until:
             QTest.qWait(10)
         self.assertEqual(self.window.active_tasks, 0, "Desktop worker did not finish")
+
+    def test_worker_wait_allows_slow_runner_without_skipping_completion_assertion(self):
+        self.window.active_tasks = 1
+        def complete(_milliseconds):
+            self.window.active_tasks = 0
+        with patch.object(time, "monotonic", side_effect=[0, 6]), patch.object(QTest, "qWait", side_effect=complete):
+            self.wait_for_tasks()
+        self.assertEqual(self.window.active_tasks, 0)
 
     def load(self):
         self.window.load_crates()

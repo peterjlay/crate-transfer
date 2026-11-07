@@ -396,16 +396,15 @@ def _parse_m3u_line(line: str, playlist: Path) -> Path | None:
     value = line.strip()
     if not value or value.startswith("#"):
         return None
+    if os.name == "nt" and re.match(r"^[A-Za-z]:[/\\]", value):
+        return Path(value)
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme:
         if parsed.scheme.lower() != "file" or parsed.netloc.lower() not in ("", "localhost"):
             raise ValueError(f"Playlist {playlist.name} contains a non-local media URI.")
         if parsed.query or parsed.fragment:
             raise ValueError(f"Playlist {playlist.name} contains an ambiguous media URI.")
-        value = urllib.parse.unquote(parsed.path, errors="strict")
-        if not Path(value).is_absolute():
-            raise ValueError(f"Playlist {playlist.name} contains a relative file URI.")
-        return Path(value)
+        return _local_file_uri(value, f"Playlist {playlist.name} media")
     return playlist.parent / urllib.parse.unquote(value, errors="strict")
 
 

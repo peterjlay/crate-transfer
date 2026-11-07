@@ -1,3 +1,4 @@
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from crate_transfer.mixxx import MixxxLibrary, assert_mixxx_closed
 def make_mixxx_library(directory):
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "mixxxdb.sqlite"
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.executescript("""
             CREATE TABLE track_locations(id INTEGER PRIMARY KEY AUTOINCREMENT, location TEXT UNIQUE,
                 filename TEXT, directory TEXT, filesize INTEGER, fs_deleted INTEGER, needs_verification INTEGER);
@@ -41,7 +42,7 @@ class MixxxTests(unittest.TestCase):
             library.validate_destination(directory / "incoming")
             result = library.import_crates(manifest, files, directory / "backup", "test")
             self.assertEqual((result["crates"], result["files"], result["memberships"]), (1, 1, 2))
-            with sqlite3.connect(directory / "backup" / path.name) as db:
+            with closing(sqlite3.connect(directory / "backup" / path.name)) as db, db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM library").fetchone()[0], 0)
             self.assertNotEqual(path.read_bytes(), before)
             readback = MixxxLibrary(path)
@@ -49,7 +50,7 @@ class MixxxTests(unittest.TestCase):
             self.assertEqual(exported["crates"][0]["tracks"], manifest["crates"][0]["tracks"])
             self.assertEqual(list(sources.values()), [media.resolve()])
             library.import_crates(manifest, files, directory / "second-backup", "second")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM library").fetchone()[0], 1)
                 names = [row[0] for row in db.execute("SELECT name FROM Playlists ORDER BY id")]
                 self.assertEqual(names, ["source", "source (2)"])
@@ -69,7 +70,7 @@ class MixxxTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "opened during"):
                 MixxxLibrary(path).import_crates(manifest, {}, directory / "backup", "test", guard)
             for candidate in (path, directory / "backup" / path.name):
-                with sqlite3.connect(candidate) as db:
+                with closing(sqlite3.connect(candidate)) as db, db:
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM Playlists").fetchone()[0], 0)
 
     def test_process_and_unknown_write_schema_fail_closed(self):
@@ -80,7 +81,7 @@ class MixxxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             path = make_mixxx_library(directory / "library")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TRIGGER custom AFTER INSERT ON library BEGIN UPDATE library SET title='x'; END")
             with self.assertRaisesRegex(ValueError, "triggers"):
                 MixxxLibrary(path).validate_destination(directory / "incoming")
@@ -91,7 +92,7 @@ class MixxxTests(unittest.TestCase):
             media = directory / "track.mp3"
             media.write_bytes(b"synthetic Mixxx audio")
             path = directory / "mixxxdb.sqlite"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.executescript("""
                     CREATE TABLE library(id INTEGER, location INTEGER, title TEXT, artist TEXT, album TEXT, bpm REAL);
                     CREATE TABLE track_locations(id INTEGER, location TEXT);
@@ -122,7 +123,7 @@ class MixxxTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No existing"):
                 MixxxLibrary(path)
             self.assertFalse(path.exists())
-            with sqlite3.connect(path):
+            with closing(sqlite3.connect(path)) as db, db:
                 pass
             with self.assertRaisesRegex(ValueError, "Unsupported Mixxx schema"):
                 MixxxLibrary(path)

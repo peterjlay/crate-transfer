@@ -2,9 +2,10 @@ import hashlib
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest.mock import patch
 
-from crate_transfer.exchange import ExchangeLibrary, write_exchange
+from crate_transfer.exchange import ExchangeLibrary, write_exchange, _parse_m3u_line
 from crate_transfer.protocol import PROTOCOL
 
 
@@ -18,6 +19,18 @@ def record(name, content, metadata=None):
 
 
 class ExchangeTests(unittest.TestCase):
+    def test_windows_m3u_local_paths_and_file_uris_do_not_become_relative_or_remote(self):
+        playlist = PureWindowsPath("D:/Playlists/Set.m3u")
+        with patch("crate_transfer.exchange.os.name", "nt"), \
+                patch("crate_transfer.exchange.Path", PureWindowsPath):
+            for raw in ("C:\\Music\\Track #1.mp3", "C:/Music/Track #1.mp3",
+                        "file:///C:/Music/Track%20%231.mp3", "file://localhost/C:/Music/Track%20%231.mp3"):
+                self.assertEqual(_parse_m3u_line(raw, playlist), PureWindowsPath("C:/Music/Track #1.mp3"))
+            self.assertEqual(_parse_m3u_line("../Music/song.mp3", playlist),
+                             playlist.parent / "../Music/song.mp3")
+            for raw in ("file:relative.mp3", "https://remote/song.mp3", "file://remote/C:/Music/song.mp3"):
+                with self.subTest(raw=raw), self.assertRaises(ValueError):
+                    _parse_m3u_line(raw, playlist)
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

@@ -9,9 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from crate_transfer.agent import Agent, Client, TransferError, check_transfer, export_local, pair_computer, recover_receipt, send_crates
+from crate_transfer.agent import Agent, Client, Handler, TransferError, check_transfer, export_local, pair_computer, recover_receipt, send_crates
 from crate_transfer.config import Settings, atomic_json
 from crate_transfer.identity import client_context
 from crate_transfer.library import LibraryError, portable_path
@@ -24,6 +24,46 @@ OTHER_ID = "33333333-3333-4333-8333-333333333333"
 
 
 class AgentTests(unittest.TestCase):
+    def test_authentication_rejection_drains_only_bounded_bodies_before_responding(self):
+        for length, transfer_encoding, consumed in ((3, None, 3), (8 * 1024 * 1024 + 1, None, 0),
+                                                    (3, "chunked", 0)):
+            with self.subTest(length=length, transfer_encoding=transfer_encoding):
+                handler = Handler.__new__(Handler)
+                handler.command, handler.path = "PUT", "/api/transfers/rejected/files/rejected"
+                handler.headers = {"Content-Length": str(length), "Authorization": "Bearer invalid"}
+                if transfer_encoding:
+                    handler.headers["Transfer-Encoding"] = transfer_encoding
+                handler.connection = Mock()
+                handler.connection.gettimeout.return_value = 45
+                handler.rfile = io.BytesIO(b"abc")
+                authorize = Mock(side_effect=PermissionError("This computer is not paired."))
+                handler.server = SimpleNamespace(agent=SimpleNamespace(authorize=authorize))
+                with patch("crate_transfer.agent.time.monotonic", return_value=0), \
+                        self.assertRaisesRegex(PermissionError, "not paired"):
+                    handler.dispatch()
+                self.assertEqual(handler.rfile.tell(), consumed)
+                authorize.assert_called_once_with("invalid")
+                if consumed:
+                    self.assertEqual(handler.connection.settimeout.call_args_list,
+                                     [unittest.mock.call(1), unittest.mock.call(45)])
+                else:
+                    handler.connection.settimeout.assert_not_called()
+
+    def test_rejected_body_drain_has_total_deadline_even_with_trickling_data(self):
+        handler = Handler.__new__(Handler)
+        handler.headers = {"Content-Length": "3"}
+        handler.connection = Mock()
+        handler.connection.gettimeout.return_value = 45
+        handler.rfile = Mock()
+        handler.rfile.read1.return_value = b"x"
+        with patch("crate_transfer.agent.time.monotonic", side_effect=[0, 0, 2]), \
+                self.assertLogs("crate_transfer.agent", level="WARNING") as logs:
+            handler.discard_rejected_body()
+        self.assertIn("deadline", logs.output[0])
+        handler.rfile.read1.assert_called_once_with(3)
+        self.assertEqual(handler.connection.settimeout.call_args_list,
+                         [unittest.mock.call(1), unittest.mock.call(45)])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import sqlite3
 import struct
@@ -362,6 +363,9 @@ def _bookmark_path(data):
         cursor = start + length
     if len(paths) > 1:
         raise LibraryError("Conflicting embedded djay bookmark paths.")
+    if paths and os.name == "nt":
+        raise LibraryError("macOS djay bookmark paths cannot be mapped to a Windows drive. "
+                           "Use a native library with valid destination-local file URIs.")
     return Path(next(iter(paths))).resolve() if paths else None
 
 
