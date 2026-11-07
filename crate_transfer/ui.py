@@ -21,16 +21,19 @@ from .agent import Agent, check_transfer, export_local, pair_computer, send_crat
 from .config import Settings
 from .compatibility import compatibility_warnings
 from .catalog import (
-    OUTPUT_NAMES, SOURCES, find_source, source_definition, source_exists, source_guidance, source_library,
+    OUTPUT_NAMES, SOURCES, default_destination_path, find_source, source_definition, source_exists,
+    source_guidance, source_library,
 )
 from .discovery import Discovery
 from .library import Library
 from .protocol import NATIVE_DESTINATIONS, label
-from .native import NATIVE_NAMES, destination_path, native_library
+from .native import NATIVE_NAMES, native_library
 from .portable import METADATA_WARNING
 from . import startup
 
 LOG = logging.getLogger(__name__)
+
+NON_PREVIEW_NATIVE = frozenset(("serato", "traktor", "rekordbox-native"))
 
 STYLE = """
 QWidget { background: #101318; color: #e8ecf1; font-family: ".AppleSystemUIFont", "Segoe UI";
@@ -495,12 +498,18 @@ class Window(QMainWindow):
         form.addRow("", button("Save djay destination settings", self.save_djay_settings))
         self.native_library_inputs = {}
         self.native_receive_inputs = {}
+        settings = self.settings.snapshot()
         for format in ("serato3", "traktor", "virtualdj-native", "engine", "rekordbox-native", "mixxx"):
-            field = QLineEdit(destination_path(self.settings.snapshot(), format))
+            path = settings["native_libraries"].get(format)
+            field = QLineEdit(default_destination_path(format) if path is None else path)
             field.setPlaceholderText("Existing native library file or folder")
+            if format == "traktor":
+                field.setToolTip("Suggested collection is from the newest Traktor version found in "
+                                 "Documents/Native Instruments. Check it matches the version you use.")
             self.native_library_inputs[format] = field
             form.addRow(f"{NATIVE_NAMES[format]} destination", self.path_field(field))
-            enabled = QCheckBox(f"Allow {NATIVE_NAMES[format]} native imports (preview; close DJ app)")
+            qualifier = "close DJ app" if format in NON_PREVIEW_NATIVE else "preview; close DJ app"
+            enabled = QCheckBox(f"Allow {NATIVE_NAMES[format]} native imports ({qualifier})")
             enabled.setChecked(self.settings.snapshot()["native_receive"].get(format) is True)
             self.native_receive_inputs[format] = enabled
             form.addRow("Native reception", enabled)
@@ -770,8 +779,9 @@ class Window(QMainWindow):
                   "Existing crates will not be merged or replaced. "
                   + ("Serato must be closed on that computer. Database-only performance metadata is "
                      "not converted; repeated tracks are kept once per crate." if destination == "serato" else
-                     f"{NATIVE_NAMES[destination]} must be closed on that computer. Native registration is a preview. "
-                     "Check Activity for unsupported metadata and analysis warnings, and verify playback in the DJ app."))
+                     f"{NATIVE_NAMES[destination]} must be closed on that computer. "
+                     + ("" if destination in NON_PREVIEW_NATIVE else "Native registration is a preview. ")
+                     + "Check Activity for unsupported metadata and analysis warnings, and verify playback in the DJ app."))
         answer = QMessageBox.question(
             self, "Send crates and music?", detail + "\n\n" + "\n\n".join(
                 compatibility_warnings(source_format, destination)),
@@ -813,7 +823,9 @@ class Window(QMainWindow):
                        "Exchange-file database metadata is not converted into Serato; embedded media stays unchanged."
                        if destination == "serato" else
                        f"Import playlists and register media in the configured local {NATIVE_NAMES[destination]} library? "
-                       "Quit that DJ app first. This is a preview: verify file access/playback in the destination. "
+                       "Quit that DJ app first. "
+                       + ("" if destination in NON_PREVIEW_NATIVE else "This is a preview. ")
+                       + "Verify file access/playback in the destination. "
                        "Full analysis is not generated; read Activity warnings.")
         else:
             directory = QFileDialog.getExistingDirectory(

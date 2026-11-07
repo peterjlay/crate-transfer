@@ -20,8 +20,8 @@ class SourceFormat:
 SOURCES = (
     SourceFormat("serato", "Serato DJ 4+ library"),
     SourceFormat("serato3", "Serato DJ 3 legacy crates (preview)"),
-    SourceFormat("rekordbox-native", "rekordbox native database (preview)"),
-    SourceFormat("traktor", "Traktor native collection (preview)"),
+    SourceFormat("rekordbox-native", "rekordbox native database"),
+    SourceFormat("traktor", "Traktor native collection"),
     SourceFormat("djay", "Algoriddim djay Pro native library (preview)"),
     SourceFormat("engine", "Engine DJ native library (preview)"),
     SourceFormat("virtualdj-native", "VirtualDJ native database (preview)"),
@@ -34,8 +34,8 @@ SOURCES = (
 OUTPUT_NAMES = {
     "serato": "Serato library (automatic import)",
     "serato3": "Serato DJ 3 legacy crates (preview native import)",
-    "rekordbox-native": "rekordbox native library (runtime-gated preview)",
-    "traktor": "Traktor native collection (preview automatic import)",
+    "rekordbox-native": "rekordbox native library (runtime/schema-gated automatic import)",
+    "traktor": "Traktor native collection (automatic import)",
     "djay": "djay Pro native library (preview automatic import)",
     "engine": "Engine DJ native library (schema-gated preview)",
     "virtualdj-native": "VirtualDJ native library (preview automatic import)",
@@ -79,17 +79,29 @@ def default_source_paths(format: str, home: Path | None = None, platform: str | 
     return []
 
 
-def find_source(format: str) -> Path | None:
-    """Check usual paths only when the user selects a source; never opens a library."""
-    candidates = default_source_paths(format)
+def default_destination_path(format: str, home: Path | None = None, platform: str | None = None) -> str:
+    platform = platform or sys.platform
+    if format == "rekordbox-native" and platform == "darwin":
+        return str(default_source_paths(format, home, platform)[0].parent)
+    if format == "traktor":
+        collection = find_source(format, home)
+        return str(collection) if collection is not None else ""
+    return ""
+
+
+def find_source(format: str, home: Path | None = None) -> Path | None:
+    """Check usual paths without opening a library."""
+    home = home or Path.home()
+    candidates = default_source_paths(format, home)
     if format in ("traktor-nml", "traktor"):
-        native = Path.home() / "Documents/Native Instruments"
+        native = home / "Documents/Native Instruments"
         if native.is_dir():
             candidates = sorted(
                 native.glob("Traktor */collection.nml"),
                 key=lambda path: tuple(int(part) for part in re.findall(r"\d+", path.parent.name)),
                 reverse=True,
             )
+        return next((path for path in candidates if path.is_file()), None)
     return next((path for path in candidates if path.exists()), None)
 
 
@@ -137,7 +149,10 @@ def source_guidance(format: str) -> str:
     if format == "djay":
         return ("Close djay before reading/importing its native library. Preview TSAF adapter: new-media file access "
                 "and playback must be verified in djay; full analysis and sandbox bookmarks are not generated.")
-    if format in ("virtualdj-native", "engine", "rekordbox-native"):
+    if format == "rekordbox-native":
+        return ("Close rekordbox before accessing its native library. Supported schema and runtime are required; "
+                "check Activity for unsupported metadata or analysis warnings.")
+    if format in ("virtualdj-native", "engine"):
         return ("Close the source DJ application before accessing its native library. This is a schema/runtime-gated "
                 "preview; check Activity for unsupported metadata or analysis warnings.")
     return "Native integration is not yet available here. Do not modify the library; use an available exchange format."

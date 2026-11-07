@@ -519,6 +519,57 @@ class DesktopTests(unittest.TestCase):
             library.assert_not_called()
         self.assertEqual(self.errors, [])
 
+    def test_rekordbox_destination_default_does_not_override_saved_path_or_enable_reception(self):
+        default = str(self.base / "Library/Pioneer/rekordbox")
+        with patch("crate_transfer.ui.default_destination_path", return_value=default):
+            page = self.window.settings_page()
+            self.assertEqual(self.window.native_library_inputs["rekordbox-native"].text(), default)
+            self.assertFalse(self.window.native_receive_inputs["rekordbox-native"].isChecked())
+            self.assertNotIn("rekordbox-native", self.settings.snapshot()["native_libraries"])
+            for saved in ("", str(self.base / "custom")):
+                self.settings.update(native_libraries={"rekordbox-native": saved})
+                other_page = self.window.settings_page()
+                self.assertEqual(self.window.native_library_inputs["rekordbox-native"].text(), saved)
+                other_page.deleteLater()
+            page.deleteLater()
+
+    def test_traktor_suggestion_is_editable_and_saved_paths_take_precedence(self):
+        folder = self.base / "Documents/Native Instruments/Traktor 4.5.0"
+        folder.mkdir(parents=True)
+        collection = folder / "collection.nml"
+        collection.write_text("not parsed during discovery", encoding="utf-8")
+        with patch("crate_transfer.catalog.Path.home", return_value=self.base):
+            page = self.window.settings_page()
+            field = self.window.native_library_inputs["traktor"]
+            self.assertEqual(field.text(), str(collection))
+            self.assertFalse(field.isReadOnly())
+            self.assertFalse(self.window.native_receive_inputs["traktor"].isChecked())
+            self.assertNotIn("traktor", self.settings.snapshot()["native_libraries"])
+            for saved in ("", str(self.base / "custom-collection.nml")):
+                self.settings.update(native_libraries={"traktor": saved})
+                other_page = self.window.settings_page()
+                self.assertEqual(self.window.native_library_inputs["traktor"].text(), saved)
+                other_page.deleteLater()
+            page.deleteLater()
+
+    def test_preview_labels_match_native_destination_status_in_settings_and_confirmations(self):
+        self.load()
+        self.window.all_items()[0].setCheckState(0, Qt.CheckState.Checked)
+        peer = "22222222-2222-4222-8222-222222222222"
+        self.settings.update(peers={peer: {"id": peer, "name": "DJ Laptop", "host": "127.0.0.1",
+                                           "port": 49783, "fingerprint": "a" * 64, "token": "test-token"}})
+        self.window.refresh_computers()
+        self.window.target.setCurrentIndex(1)
+        with patch("crate_transfer.ui.QMessageBox.question", return_value=QMessageBox.StandardButton.No) as question:
+            for format, preview in (("traktor", False), ("rekordbox-native", False), ("engine", True)):
+                with self.subTest(format=format):
+                    self.assertEqual("preview" in self.window.native_receive_inputs[format].text().lower(), preview)
+                    self.window.destination_format.setCurrentIndex(self.window.destination_format.findData(format))
+                    self.window.export_portable()
+                    self.assertEqual("preview" in question.call_args.args[2].lower(), preview)
+                    self.window.send()
+                    self.assertEqual("preview" in question.call_args.args[2].lower(), preview)
+
     def test_serato_version_warning_is_shown_before_local_conversion_and_network_send(self):
         self.load()
         self.window.all_items()[0].setCheckState(0, Qt.CheckState.Checked)

@@ -3,10 +3,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from crate_transfer.catalog import default_source_paths, find_source, source_exists, source_guidance
+from crate_transfer.catalog import (default_destination_path, default_source_paths, find_source,
+                                    OUTPUT_NAMES, source_definition, source_exists, source_guidance)
 
 
 class CatalogTests(unittest.TestCase):
+    def test_traktor_and_rekordbox_are_not_labeled_preview(self):
+        for format in ("traktor", "rekordbox-native"):
+            self.assertNotIn("preview", source_definition(format).name.lower())
+            self.assertNotIn("preview", OUTPUT_NAMES[format].lower())
+            self.assertNotIn("preview", source_guidance(format).lower())
+        self.assertIn("preview", source_definition("engine").name.lower())
+        self.assertIn("preview", OUTPUT_NAMES["engine"].lower())
+        self.assertIn("preview", source_guidance("engine").lower())
+
+    def test_rekordbox_destination_default_is_user_specific_and_macos_only(self):
+        home = Path("/synthetic-home")
+        self.assertEqual(default_destination_path("rekordbox-native", home, "darwin"),
+                         str(home / "Library/Pioneer/rekordbox"))
+        self.assertEqual(default_destination_path("rekordbox-native", home, "win32"), "")
+
     def test_default_paths_are_platform_specific_without_accessing_any_libraries(self):
         home = Path("/synthetic-home")
         self.assertEqual(default_source_paths("serato", home, "darwin"),
@@ -66,3 +82,20 @@ class CatalogTests(unittest.TestCase):
                 (folder / "collection.nml").write_text("not opened during detection", encoding="utf-8")
             with patch("crate_transfer.catalog.Path.home", return_value=home):
                 self.assertEqual(find_source("traktor-nml"), native / "Traktor 4.10/collection.nml")
+
+    def test_traktor_destination_suggests_newest_existing_collection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            native = home / "Documents/Native Instruments"
+            self.assertEqual(default_destination_path("traktor", home, "darwin"), "")
+            for version in ("4.4.1", "4.5.0"):
+                folder = native / ("Traktor " + version)
+                folder.mkdir(parents=True)
+                (folder / "collection.nml").write_text("not parsed", encoding="utf-8")
+            (native / "Traktor 5.0/collection.nml").mkdir(parents=True)
+            expected = native / "Traktor 4.5.0/collection.nml"
+            self.assertEqual(default_destination_path("traktor", home, "darwin"), str(expected))
+            self.assertEqual(default_destination_path("traktor", home, "win32"), str(expected))
+            expected.unlink()
+            self.assertEqual(default_destination_path("traktor", home, "darwin"),
+                             str(native / "Traktor 4.4.1/collection.nml"))

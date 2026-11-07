@@ -41,8 +41,7 @@ RUNTIME_HELP = (
 CAVEAT = (
     "rekordbox native conversion preserves normal playlist order and basic tags only. "
     "Smart playlists, cues, loops, beatgrids, waveforms and analysis are not converted. "
-    "Analyze received tracks in rekordbox and verify playback; native application "
-    "acceptance has not been tested against a real DJ library."
+    "Analyze received tracks in rekordbox and verify playback."
 )
 SCHEMA = {
     "djmdContent": {"ID", "FolderPath", "Title", "ArtistID", "AlbumID", "KeyID", "BPM"},
