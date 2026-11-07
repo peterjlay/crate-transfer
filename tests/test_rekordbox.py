@@ -16,7 +16,7 @@ import sqlite3
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,7 +38,7 @@ def make_rekordbox_library(directory):
     audio = directory.parent / (directory.name + "-source.mp3")
     audio.write_bytes(b"rights-owned synthetic audio bytes")
     path = directory / "master.db"
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.executescript("""
             CREATE TABLE djmdContent(ID TEXT PRIMARY KEY, FolderPath TEXT, Title TEXT,
                 ArtistID TEXT, AlbumID TEXT, KeyID TEXT, BPM INTEGER);
@@ -114,7 +114,7 @@ class FakeSdk:
         owner.calls.append(kwargs)
         self.session = object()
         self.engine = SimpleNamespace(dispose=lambda: owner.events.append("dispose"))
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.row_factory = sqlite3.Row
             self.tracks = [SimpleNamespace(**dict(row)) for row in db.execute("SELECT * FROM djmdContent")]
             self.playlists = [SimpleNamespace(**dict(row), Songs=[]) for row in db.execute("SELECT * FROM djmdPlaylist")]
@@ -199,7 +199,7 @@ class FakeSdk:
 
     def commit(self):
         self.owner.events.append("commit")
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             for table, rows in (("djmdContent", self.tracks), ("djmdPlaylist", self.playlists),
                                 *self.tags.items()):
                 columns = [item[1] for item in db.execute(f"PRAGMA table_info({table})")]
@@ -216,7 +216,7 @@ class FakeSdk:
             raise OSError("synthetic XML write failure after database commit")
         self.xml.write(self.path.parent / "masterPlaylists6.xml", encoding="utf-8")
         if self.owner.failure == "readback":
-            with sqlite3.connect(self.path) as db:
+            with closing(sqlite3.connect(self.path)) as db, db:
                 db.execute("UPDATE djmdContent SET FolderPath='broken' WHERE ID!='1'")
         if self.owner.failure == "missing-xml-node":
             self.xml.find("PLAYLISTS").clear()
@@ -324,19 +324,19 @@ class RekordboxTests(unittest.TestCase):
         self.assertIn(["Sets", "House"], [row["path"] for row in exported])
         self.assertIn(["Sets", "House (Imported 2)"], [row["path"] for row in exported])
         self.assertIn(["Sets", "New", "Empty"], [row["path"] for row in exported])
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute("SELECT Title FROM djmdContent WHERE ID='1'").fetchone()[0], "Title")
             self.assertEqual(db.execute("SELECT COUNT(*) FROM djmdPlaylist WHERE Name='Sets'").fetchone()[0], 1)
 
     def test_existing_final_track_path_reuses_native_id_without_metadata_overwrite(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("UPDATE djmdContent SET FolderPath=?", (str(self.media),))
         sdk = SdkBoundary()
         with self.boundary(sdk):
             result = self.run_import()
         self.assertFalse(any(isinstance(event, tuple) for event in sdk.events))
         self.assertTrue(any("reused" in warning for warning in result["warnings"]))
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute("SELECT Title FROM djmdContent").fetchall(), [("Title",)])
 
     def test_partial_database_commit_xml_failure_readback_failure_restore_all_originals(self):
@@ -400,7 +400,7 @@ class RekordboxTests(unittest.TestCase):
         original = self.path.read_bytes()
         for statement in statements:
             self.path.write_bytes(original)
-            with sqlite3.connect(self.path) as db:
+            with closing(sqlite3.connect(self.path)) as db, db:
                 db.execute(statement)
             with patch("crate_transfer.rekordbox.assert_rekordbox_closed"), self.assertRaises(LibraryError):
                 self.library.crates()

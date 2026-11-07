@@ -119,7 +119,7 @@ def export_bundle(manifest: dict, sources: dict[str, Path], directory: Path,
             from .exchange import write_exchange
             final_paths = {key: bundle / path.relative_to(staging) for key, path in media_paths.items()}
             exchange_file = write_exchange(format, manifest, final_paths, staging)
-            with exchange_file.open("rb") as output:
+            with exchange_file.open("r+b") as output:
                 os.fsync(output.fileno())
         # A unique directory is published only once all media and playlists verify.
         try:

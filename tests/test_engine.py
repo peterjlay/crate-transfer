@@ -1,4 +1,5 @@
 """Synthetic Engine-created schema fixtures; no real DJ library is included."""
+from contextlib import closing
 import hashlib
 import sqlite3
 import unittest
@@ -39,7 +40,7 @@ explicitLyrics isPersisted isExplicitlyExported""".split())
                            "FOREIGN KEY(listId) REFERENCES Playlist(id) ON DELETE CASCADE"],
         "PerformanceData": ["FOREIGN KEY(trackId) REFERENCES Track(id) ON DELETE CASCADE ON UPDATE CASCADE"],
     }
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         for table, columns in definitions.items():
             fields = []
             for index, column in enumerate(columns):
@@ -121,7 +122,7 @@ class EngineTests(unittest.TestCase):
 
     def seed(self):
         media = self.audio("old.mp3", b"existing audio")
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("INSERT INTO Track(path,filename,title,bpmAnalyzed,fileBytes,fileType,isAnalyzed,isAvailable)"
                        " VALUES('../Music/old.mp3','old.mp3','Old',120,?,'mp3',1,1)", (media.stat().st_size,))
             db.execute("UPDATE PerformanceData SET quickCues=?,loops=?,beatData=? WHERE trackId=1",
@@ -152,14 +153,14 @@ class EngineTests(unittest.TestCase):
         keys = [record["id"] for record in manifest["files"]]
         manifest["crates"].append({"path": ["Received", "Empty"], "tracks": []})
         manifest["crates"][0]["tracks"] = [keys[1], keys[0], keys[1]]
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             before_track = db.execute("SELECT * FROM Track WHERE id=1").fetchone()
             before_perf = db.execute("SELECT * FROM PerformanceData WHERE trackId=1").fetchone()
         receipt = self.import_media(manifest, installed)
         self.assertEqual((receipt["crates"], receipt["files"], receipt["memberships"]), (2, 2, 2))
         self.assertTrue(any("duplicate" in warning for warning in receipt["warnings"]))
         self.assertTrue(any("not written" in warning for warning in receipt["warnings"]))
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT * FROM Track WHERE id=1").fetchone(), before_track)
             self.assertEqual(db.execute("SELECT * FROM PerformanceData WHERE trackId=1").fetchone(), before_perf)
             self.assertEqual(db.execute("SELECT nextListId FROM Playlist WHERE id=1").fetchone(), (2,))
@@ -168,7 +169,7 @@ class EngineTests(unittest.TestCase):
                              (None, None, None))
             self.assertEqual(db.execute("SELECT payload FROM Unrelated").fetchone(), (b"preserve this opaque data",))
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
-        with sqlite3.connect(self.root / "backup" / "m.db") as backup:
+        with closing(sqlite3.connect(self.root / "backup" / "m.db")) as backup, backup:
             self.assertEqual(backup.execute("SELECT count(*) FROM Track").fetchone(), (1,))
             self.assertEqual(backup.execute("SELECT nextListId FROM Playlist").fetchone(), (0,))
         catalog = self.library.crates()
@@ -196,7 +197,7 @@ class EngineTests(unittest.TestCase):
                                                         "cues": [{"kind": "cue", "position": 1}]})
         receipt = self.import_media(manifest, installed)
         self.assertTrue(any("reused" in warning for warning in receipt["warnings"]))
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT title FROM Track").fetchall(), [("Old",)])
             self.assertEqual(db.execute("SELECT count(*) FROM PlaylistEntity").fetchone(), (2,))
 
@@ -211,27 +212,27 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.root / "backup").exists())
 
     def test_unknown_version_columns_and_registration_triggers_fail_closed(self):
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE Information SET schemaVersionPatch=99")
         with self.assertRaisesRegex(LibraryError, "Unsupported Engine schema"):
             self.library.crates()
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE Information SET schemaVersionPatch=1")
             db.execute("DROP TRIGGER trigger_after_insert_Track_insert_performance_data")
         with self.assertRaisesRegex(LibraryError, "triggers"):
             self.library.validate_destination(self.root / "Music")
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("ALTER TABLE Track ADD COLUMN unknown INTEGER")
         with self.assertRaisesRegex(LibraryError, "Track schema"):
             self.library.crates()
 
     def test_broken_or_external_playlist_chains_are_refused(self):
         self.seed()
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE PlaylistEntity SET nextEntityId=id")
         with self.assertRaisesRegex(LibraryError, "ordering"):
             self.library.crates()
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE PlaylistEntity SET nextEntityId=0,databaseUuid=?", (str(uuid.uuid4()),))
         with self.assertRaisesRegex(LibraryError, "another database"):
             self.library.crates()
@@ -253,7 +254,7 @@ class EngineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(LibraryError, "guard refused"):
             self.import_media(manifest, installed, guard=guard)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM Track").fetchone(), (0,))
             self.assertEqual(db.execute("SELECT count(*) FROM Playlist").fetchone(), (0,))
         self.assertTrue((self.root / "backup" / "m.db").is_file())
@@ -270,11 +271,11 @@ class EngineTests(unittest.TestCase):
         with patch("crate_transfer.engine.backup_database", side_effect=tamper):
             with self.assertRaisesRegex(LibraryError, "backup contents differ"):
                 self.import_media(manifest, installed)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("CREATE TRIGGER unexpected AFTER INSERT ON Track BEGIN DELETE FROM Unrelated; END")
         with self.assertRaisesRegex(LibraryError, "unexpectedly modified"):
             self.import_media(manifest, installed, name="second-backup")
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM Track").fetchone(), (0,))
             self.assertEqual(db.execute("SELECT count(*) FROM Unrelated").fetchone(), (1,))
 
@@ -300,13 +301,13 @@ class EngineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(LibraryError, "changed during import"):
             self.import_media(manifest, installed, guard=guard)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM Track").fetchone(), (0,))
         self.assertTrue((self.root / "backup" / "m.db").is_file())
 
     def test_unexpected_trigger_cannot_insert_additional_native_records(self):
         manifest, installed = transfer([self.audio()])
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("""
                 CREATE TRIGGER surprise AFTER INSERT ON Track
                 WHEN NEW.filename='received.mp3' BEGIN
@@ -315,7 +316,7 @@ class EngineTests(unittest.TestCase):
             """)
         with self.assertRaisesRegex(LibraryError, "unexpectedly inserted"):
             self.import_media(manifest, installed)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM Track").fetchone(), (0,))
 
     def test_unknown_column_types_are_refused(self):
@@ -327,7 +328,7 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(LibraryError, "separate"):
             self.library.validate_destination(self.database.parent)
         self.seed()
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute("UPDATE Track SET path='https://example.invalid/track.mp3'")
         with self.assertRaisesRegex(LibraryError, "local media"):
             self.library.export([1], UUID, "Sender")

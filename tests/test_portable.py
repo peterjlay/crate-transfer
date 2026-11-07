@@ -1,4 +1,5 @@
 import shutil
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,26 @@ from support import file_record, valid_manifest
 
 
 class PortableExportTests(unittest.TestCase):
+    def test_exchange_file_is_opened_writable_for_windows_fsync_and_sync_errors_propagate(self):
+        manifest, sources, _ = self.fixture()
+        manifest["destination"] = {"format": "rekordbox-xml"}
+        original_open = Path.open
+        original_fsync = os.fsync
+        exchange_descriptors = set()
+        def track_open(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            if path.name == "rekordbox.xml" and mode == "r+b":
+                exchange_descriptors.add(handle.fileno())
+            return handle
+        def fsync(descriptor):
+            if descriptor in exchange_descriptors:
+                raise OSError("synthetic exchange sync failure")
+            return original_fsync(descriptor)
+        with patch("pathlib.Path.open", track_open), patch("crate_transfer.portable.os.fsync", fsync), \
+                self.assertRaisesRegex(OSError, "exchange sync failure"):
+            export_bundle(manifest, sources, self.output, self.export_id, format="rekordbox-xml")
+        self.assertTrue(exchange_descriptors)
+        self.assertEqual(list(self.output.iterdir()), [])
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

@@ -335,6 +335,8 @@ registration research. Synthetic read/write and rollback tests are **not**
 native djay playback validation. New locations use destination-local file URIs,
 not generated sandbox bookmarks: djay may require music-folder authorization.
 Title/artist/album/BPM, supported keys and eight cue/loop slots are mapped.
+Stored macOS bookmark paths cannot be resolved onto Windows drives; use
+destination-local file URIs rather than assuming cross-platform bookmark compatibility.
 Beatgrid edits, waveforms and Neural Mix analysis are not generated. Unknown
 durations are omitted (not fabricated); readable WAV duration is used where
 available. These caveats appear in receipts; verify playback in djay before

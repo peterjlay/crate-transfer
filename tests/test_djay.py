@@ -1,5 +1,6 @@
 """Synthetic native djay fixtures only; no user library or application access."""
 import hashlib
+import os
 import tempfile
 import sqlite3
 import struct
@@ -333,13 +334,22 @@ class DjayTests(unittest.TestCase):
 
     def test_bookmark_parser_embedded_valid_conflicts_and_malformed(self):
         bookmark = _bookmark(self.audio.resolve())
-        self.assertEqual(_bookmark_path(b"opaque-prefix" + bookmark), self.audio.resolve())
+        if os.name == "nt":
+            with self.assertRaisesRegex(LibraryError, "cannot be mapped"):
+                _bookmark_path(b"opaque-prefix" + bookmark)
+        else:
+            self.assertEqual(_bookmark_path(b"opaque-prefix" + bookmark), self.audio.resolve())
         self.assertIsNone(_bookmark_path(b"opaque-no-signature"))
         with self.assertRaisesRegex(LibraryError, "Conflicting"):
             _bookmark_path(bookmark + _bookmark(self.audio.with_name("other.mp3").resolve()))
         for malformed in (b"book", bookmark[:-1], b"book" + bytes(100)):
             with self.subTest(malformed=malformed[:20]), self.assertRaises(LibraryError):
                 _bookmark_path(malformed)
+
+    def test_posix_bookmark_does_not_fabricate_a_windows_drive(self):
+        bookmark = _bookmark(self.audio.resolve())
+        with patch("crate_transfer.djay.os.name", "nt"), self.assertRaisesRegex(LibraryError, "cannot be mapped"):
+            _bookmark_path(bookmark)
 
     def test_application_guard_djay_denied_and_race(self):
         with patch("crate_transfer.djay.psutil.process_iter", return_value=[SimpleNamespace(info={"name": "djay Pro"})]):
